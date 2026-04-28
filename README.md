@@ -2,7 +2,7 @@
 
 A real-time web app for managing daily fuel orders across a network of five gas stations in Honduras. Built to replace a manual, spreadsheet-based workflow with an intelligent ordering system that forecasts demand, validates cistern compartment assignments, and syncs live across multiple users.
 
-**Live demo:** _coming soon_  
+**Live demo:** https://lustrous-gnome-afff44.netlify.app  
 **Repository:** https://github.com/a-escobar/fuel-order-management
 
 ---
