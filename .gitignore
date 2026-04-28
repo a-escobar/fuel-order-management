@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor folders
+.vscode/
+.idea/
+
+# Backups / exports
+gasolineras_backup_*.json
+
+# Old file name (index.html is the canonical version)
+gas_station_manager.html
+
+# Setup guide (internal, not needed in repo)
+GUIA_CONFIGURACION_NUBE.md
+
+# Excel working files
+Registro_Gasolineras.xlsx
