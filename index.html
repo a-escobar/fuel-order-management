@@ -31,6 +31,9 @@ const { useState, useEffect, useMemo, useCallback } = React;
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════
 const STATIONS    = ['Puma Juticalpa','Limones','Las Delicias','La Granja','Puma Paz'];
+// Supply-only: we don't manage their tanks; they tell us how much they need
+const SUPPLY_ONLY = new Set(['Limones', 'Puma Paz']);
+const isSupplyOnly = s => SUPPLY_ONLY.has(s);
 const FUELS       = ['Regular','Super','Diesel'];
 const DAYS_ES     = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 
@@ -38,17 +41,31 @@ const DAYS_ES     = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 const JUTA_SETS = { 'Set 1': ['Regular','Super','Diesel'], 'Set 2': ['Super','Diesel'] };
 
 const FUEL_ICONS  = { Regular:'⛽', Super:'⚡', Diesel:'🔧' };
-const FUEL_COLORS = { Regular:'#2563eb', Super:'#059669', Diesel:'#d97706' };
+// Regular=Yellow, Super=Red, Diesel=Green — uniform throughout the app
+const FUEL_COLORS = { Regular:'#ca8a04', Super:'#dc2626', Diesel:'#059669' };
+const FUEL_LIGHT  = { Regular:'#fef9c3', Super:'#fee2e2', Diesel:'#d1fae5' };
 const SET_COLORS  = { 'Set 1':'#1e3a5f', 'Set 2':'#7c3aed' };
 const STATION_COLORS = {
   'Puma Juticalpa':'#1e3a5f','Limones':'#7c3aed',
   'Las Delicias':'#db2777','La Granja':'#d97706','Puma Paz':'#059669'
 };
 
-// Operating thresholds
+// Operating thresholds (defaults; per-set overrides come from config)
 const IDEAL_PCT = 0.90;
 const MIN_PCT   = 0.50;
 const WARN_PCT  = 0.65;
+
+// Per-set threshold helpers — Set 2 has lower min/ideal than Set 1
+function getMinPct(config, setName) {
+  if (setName === 'Set 2') return (config.jutaSet2MinPct ?? 40) / 100;
+  if (setName === 'Set 1') return (config.jutaSet1MinPct ?? 50) / 100;
+  return (config.minPct ?? 50) / 100;
+}
+function getIdealPct(config, setName) {
+  if (setName === 'Set 2') return (config.jutaSet2IdealPct ?? 75) / 100;
+  if (setName === 'Set 1') return (config.jutaSet1IdealPct ?? 90) / 100;
+  return (config.idealPct ?? 90) / 100;
+}
 
 // Default cisternas
 const DEFAULT_CISTERNAS = {
@@ -98,9 +115,29 @@ function getMorning(log, station, date, fuel, setName) {
   return isJuta(station) ? (e.morning?.[setName]?.[fuel] ?? null) : (e.morning?.[fuel] ?? null);
 }
 function getDescarga(log, station, date, fuel, setName) {
+  // Only fuel physically delivered into underground tanks (status: delivered)
   const e = log[station]?.[date];
   if (!e) return 0;
   return isJuta(station) ? (e.descarga?.[setName]?.[fuel] ?? 0) : (e.descarga?.[fuel] ?? 0);
+}
+// Fuel that arrived in a truck but hasn't been discharged into tanks yet
+function getPendingDescarga(log, station, date, fuel, setName) {
+  const e = log[station]?.[date];
+  if (!e) return 0;
+  return isJuta(station) ? (e.pendingDescarga?.[setName]?.[fuel] ?? 0) : (e.pendingDescarga?.[fuel] ?? 0);
+}
+// Manually confirmed sale entered from the POS/pump system
+function getConfirmedSale(log, station, date, fuel, setName) {
+  const e = log[station]?.[date];
+  if (!e || !e.confirmedSale) return null;
+  return isJuta(station) ? (e.confirmedSale?.[setName]?.[fuel] ?? null) : (e.confirmedSale?.[fuel] ?? null);
+}
+// Flag a sale as anomalous: zero when avg>0, or deviates >60% from weekday average
+function isAnomalous(sale, avg) {
+  if (sale === null) return false;
+  if (avg === null || avg === 0) return sale === 0;
+  const ratio = sale / avg;
+  return ratio < 0.4 || ratio > 2.5;
 }
 // Sale for date D = morning[D] + descarga[D] - morning[D+1]
 function getSale(log, station, date, fuel, setName) {
@@ -125,12 +162,15 @@ function getMaxCap(config, station, fuel, setName) {
   return config.stationConfig[station]?.fuels?.[fuel]?.max ?? 0;
 }
 // Projected level at Day 3 morning (after Day 1 + Day 2 sales consumed, before delivery)
+// Includes pending fuel from yesterday's truck (in truck, not yet discharged)
 function projAtDelivery(log, config, station, today, fuel, setName, overrides) {
   const morning = getMorning(log, station, today, fuel, setName) ?? 0;
   const existingDescarga = getDescarga(log, station, today, fuel, setName);
+  const pendingYesterday = getPendingDescarga(log, station, addDays(today,-1), fuel, setName);
+  const pendingToday = getPendingDescarga(log, station, today, fuel, setName);
   const d1 = getForecast(log, station, today,           fuel, setName, overrides?.[today]?.[fuel]) ?? 0;
   const d2 = getForecast(log, station, addDays(today,1),fuel, setName, overrides?.[addDays(today,1)]?.[fuel]) ?? 0;
-  return Math.max(0, morning + existingDescarga - d1 - d2);
+  return Math.max(0, morning + existingDescarga + pendingYesterday + pendingToday - d1 - d2);
 }
 function projD3End(log, config, station, today, fuel, setName, overrides) {
   const atDel = projAtDelivery(log, config, station, today, fuel, setName, overrides);
@@ -247,8 +287,12 @@ function autoOptimize(comps, stations, targets, maxSpace) {
 // ═══════════════════════════════════════════════════════════
 function defaultConfig() {
   return {
-    minPct: MIN_PCT * 100,
+    minPct: MIN_PCT * 100,          // for non-Juticalpa stations
     idealPct: IDEAL_PCT * 100,
+    jutaSet1MinPct: 50,
+    jutaSet1IdealPct: 90,
+    jutaSet2MinPct: 40,
+    jutaSet2IdealPct: 75,
     stationConfig: {
       'Puma Juticalpa': { type:'sets', sets: {
         'Set 1': { Regular:{max:6000}, Super:{max:6000}, Diesel:{max:8000} },
@@ -378,17 +422,54 @@ const S = {
 };
 
 // ═══════════════════════════════════════════════════════════
+// ACCUMULATE INPUT — lets you add multiple compartment values
+// ═══════════════════════════════════════════════════════════
+function AccumInput({ value, onChange, style, placeholder }) {
+  const [addStr, setAddStr] = useState('');
+  const [open,   setOpen]   = useState(false);
+  function apply() {
+    const n = parseFloat(addStr);
+    if (!isNaN(n) && n > 0) onChange((parseFloat(value) || 0) + n);
+    setAddStr(''); setOpen(false);
+  }
+  return (
+    <div style={{ display:'flex', gap:4, alignItems:'center', flexWrap:'wrap' }}>
+      <input type="number" min="0" value={value??''} placeholder={placeholder||'0'}
+        onChange={e => onChange(e.target.value===''?null:+e.target.value)}
+        style={style} />
+      <button type="button" onClick={() => setOpen(p=>!p)} title="Acumular valores"
+        style={{ padding:'4px 8px', border:'1px solid #d1d5db', borderRadius:6, background:'#f8fafc', cursor:'pointer', fontSize:13, color:'#64748b', flexShrink:0 }}>
+        +
+      </button>
+      {open && (
+        <>
+          <input type="number" min="0" value={addStr} placeholder="añadir…"
+            onChange={e=>setAddStr(e.target.value)}
+            onKeyDown={e=>e.key==='Enter'&&apply()}
+            autoFocus
+            style={{ width:80, padding:'4px 6px', border:'1px solid #d1d5db', borderRadius:6, fontSize:13 }} />
+          <button type="button" onClick={apply}
+            style={{ padding:'4px 8px', border:'none', borderRadius:6, background:'#1e3a5f', color:'white', cursor:'pointer', fontSize:13 }}>✓</button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
 // LEVEL INDICATOR (reused everywhere)
 // ═══════════════════════════════════════════════════════════
-function LevelBar({ level, max, color }) {
+function LevelBar({ level, max, color, minPct, idealPct }) {
+  const mp = minPct  ?? MIN_PCT;
+  const ip = idealPct ?? IDEAL_PCT;
   const p = max > 0 ? Math.min(100, (level/max)*100) : 0;
-  const barCol = p < MIN_PCT*100 ? '#ef4444' : p < WARN_PCT*100 ? '#f59e0b' : color;
+  const barCol = p < mp*100 ? '#ef4444' : p < WARN_PCT*100 ? '#f59e0b' : color;
   return (
     <div>
       <div style={{ ...S.tankBar, marginTop:6 }}>
         <div style={{ ...S.tankFill, width:`${p}%`, background:barCol }} />
-        <div style={{ position:'absolute', top:0, left:`${MIN_PCT*100}%`, width:2, height:'100%', background:'#ef444460' }} />
-        <div style={{ position:'absolute', top:0, left:`${IDEAL_PCT*100}%`, width:2, height:'100%', background:'#05966960' }} />
+        <div style={{ position:'absolute', top:0, left:`${mp*100}%`, width:2, height:'100%', background:'#ef444460' }} />
+        <div style={{ position:'absolute', top:0, left:`${ip*100}%`, width:2, height:'100%', background:'#05966960' }} />
       </div>
       <div style={{ display:'flex', justifyContent:'space-between', fontSize:11, color:'#94a3b8', marginTop:2 }}>
         <span style={{ color:barCol, fontWeight:p<WARN_PCT*100?700:400 }}>{Math.round(p)}%</span>
@@ -505,16 +586,51 @@ function ConfigTab({ config, setConfig, cisternas, setCisternas }) {
       {/* Global settings */}
       <div style={S.card}>
         <div style={S.title}>🎯 Parámetros Globales</div>
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
-          <div>
-            <label style={S.label}>Nivel mínimo (%)</label>
-            <input style={S.input} type="number" min="0" max="100" value={config.minPct||50} onChange={e=>updGlobal('minPct',e.target.value)} />
-            <div style={{ fontSize:12, color:'#64748b', marginTop:4 }}>⚠️ Alertar cuando el nivel proyectado baje de este %</div>
+
+        {/* Non-Juticalpa stations */}
+        <div style={{ marginBottom:16 }}>
+          <div style={{ fontWeight:600, color:'#64748b', fontSize:13, marginBottom:10 }}>Las Delicias · La Granja (gasolineras simples)</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
+            <div>
+              <label style={S.label}>Nivel mínimo (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.minPct||50} onChange={e=>updGlobal('minPct',e.target.value)} />
+              <div style={{ fontSize:12, color:'#64748b', marginTop:4 }}>⚠️ Alertar cuando el nivel proyectado baje de este %</div>
+            </div>
+            <div>
+              <label style={S.label}>Nivel ideal / objetivo (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.idealPct||90} onChange={e=>updGlobal('idealPct',e.target.value)} />
+              <div style={{ fontSize:12, color:'#64748b', marginTop:4 }}>🎯 Llenar hasta este % al hacer un pedido</div>
+            </div>
           </div>
-          <div>
-            <label style={S.label}>Nivel ideal / objetivo (%)</label>
-            <input style={S.input} type="number" min="0" max="100" value={config.idealPct||90} onChange={e=>updGlobal('idealPct',e.target.value)} />
-            <div style={{ fontSize:12, color:'#64748b', marginTop:4 }}>🎯 Llenar hasta este % al hacer un pedido</div>
+        </div>
+
+        {/* Juticalpa Set 1 */}
+        <div style={{ marginBottom:12, padding:14, background:'#f8fafc', borderRadius:10, borderLeft:`4px solid ${SET_COLORS['Set 1']}` }}>
+          <div style={{ fontWeight:700, color:SET_COLORS['Set 1'], fontSize:13, marginBottom:10 }}>🛢️ Puma Juticalpa — Set 1</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
+            <div>
+              <label style={S.label}>Nivel mínimo (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.jutaSet1MinPct??50} onChange={e=>updGlobal('jutaSet1MinPct',e.target.value)} />
+            </div>
+            <div>
+              <label style={S.label}>Nivel ideal (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.jutaSet1IdealPct??90} onChange={e=>updGlobal('jutaSet1IdealPct',e.target.value)} />
+            </div>
+          </div>
+        </div>
+
+        {/* Juticalpa Set 2 */}
+        <div style={{ padding:14, background:'#f8fafc', borderRadius:10, borderLeft:`4px solid ${SET_COLORS['Set 2']}` }}>
+          <div style={{ fontWeight:700, color:SET_COLORS['Set 2'], fontSize:13, marginBottom:10 }}>🛢️ Puma Juticalpa — Set 2</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
+            <div>
+              <label style={S.label}>Nivel mínimo (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.jutaSet2MinPct??40} onChange={e=>updGlobal('jutaSet2MinPct',e.target.value)} />
+            </div>
+            <div>
+              <label style={S.label}>Nivel ideal (%)</label>
+              <input style={S.input} type="number" min="0" max="100" value={config.jutaSet2IdealPct??75} onChange={e=>updGlobal('jutaSet2IdealPct',e.target.value)} />
+            </div>
           </div>
         </div>
       </div>
@@ -588,24 +704,24 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   const [draft, setDraft] = useState({});
   const [descCistId, setDescCistId] = useState('');
   const [descComps, setDescComps] = useState({});
+  const [anomalyOk, setAnomalyOk] = useState({});  // keys confirmed by operator
 
-  // Build an empty draft for a given station
   function emptyDraft(station) {
+    if (isSupplyOnly(station)) return { requested:{}, notes:'' };
     if (isJuta(station)) {
-      const morning = {}, descarga = {};
+      const morning = {}, descarga = {}, pendingDescarga = {}, confirmedSale = {};
       for (const [sn, fuels] of Object.entries(JUTA_SETS)) {
-        morning[sn] = {}; descarga[sn] = {};
-        for (const f of fuels) { morning[sn][f]=null; descarga[sn][f]=0; }
+        morning[sn]={}; descarga[sn]={}; pendingDescarga[sn]={}; confirmedSale[sn]={};
+        for (const f of fuels) { morning[sn][f]=null; descarga[sn][f]=0; pendingDescarga[sn][f]=0; confirmedSale[sn][f]=null; }
       }
-      return { morning, descarga, notes:'' };
+      return { morning, descarga, pendingDescarga, confirmedSale, notes:'' };
     } else {
-      const morning = {}, descarga = {};
-      for (const f of FUELS) { morning[f]=null; descarga[f]=0; }
-      return { morning, descarga, notes:'' };
+      const morning={}, descarga={}, pendingDescarga={}, confirmedSale={};
+      for (const f of FUELS) { morning[f]=null; descarga[f]=0; pendingDescarga[f]=0; confirmedSale[f]=null; }
+      return { morning, descarga, pendingDescarga, confirmedSale, notes:'' };
     }
   }
 
-  // Load existing entry into draft when date/station changes
   useEffect(() => {
     const existing = dailyLog[st]?.[date];
     if (existing) {
@@ -614,10 +730,37 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
       setDescComps(existing.descComps ? JSON.parse(JSON.stringify(existing.descComps)) : {});
     } else {
       setDraft(emptyDraft(st));
-      setDescCistId('');
-      setDescComps({});
+      setDescCistId(''); setDescComps({});
     }
+    setAnomalyOk({});
   }, [date, st]);
+
+  // ── Anomaly detection: implied sale vs 2-week weekday average ──
+  const anomalies = useMemo(() => {
+    if (isSupplyOnly(st)) return [];
+    const prevDate = addDays(date, -1);
+    const result = [];
+    const check = (fuel, setName, key) => {
+      const m0 = getMorning(dailyLog, st, prevDate, fuel, setName);
+      const m1 = isJuta(st) ? (draft.morning?.[setName]?.[fuel] ?? null) : (draft.morning?.[fuel] ?? null);
+      if (m0 === null || m1 === null) return;
+      const desc = getDescarga(dailyLog, st, prevDate, fuel, setName);
+      const sale = Math.max(0, m0 + desc - m1);
+      const avg  = getForecast(dailyLog, st, prevDate, fuel, setName, null);
+      if (!isAnomalous(sale, avg)) return;
+      const reason = sale === 0 ? 'Venta en cero' : `${Math.round(Math.abs(sale/(avg||1)-1)*100)}% desviación del promedio (${fmt(avg)} gal)`;
+      result.push({ key, fuel, setName, sale, avg, reason });
+    };
+    if (isJuta(st)) {
+      for (const [sn, fuels] of Object.entries(JUTA_SETS)) fuels.forEach(f => check(f, sn, `${sn}_${f}`));
+    } else {
+      FUELS.forEach(f => check(f, null, `null_${f}`));
+    }
+    return result;
+  }, [draft.morning, date, st, dailyLog]);
+
+  const unconfirmedAnomalies = anomalies.filter(a => !anomalyOk[a.key]);
+  const canSave = unconfirmedAnomalies.length === 0;
 
   function setMorning(fuel, setName, val) {
     setDraft(p => {
@@ -630,68 +773,104 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   function setDescManual(fuel, setName, val) {
     setDraft(p => {
       const n = JSON.parse(JSON.stringify(p));
-      if (setName) n.descarga[setName][fuel] = +val||0;
-      else n.descarga[fuel] = +val||0;
+      if (setName) n.descarga[setName][fuel] = val===null?0:(+val||0);
+      else n.descarga[fuel] = val===null?0:(+val||0);
+      return n;
+    });
+  }
+  function setConfirmedSale(fuel, setName, val) {
+    setDraft(p => {
+      const n = JSON.parse(JSON.stringify(p));
+      if (!n.confirmedSale) n.confirmedSale = {};
+      if (setName) {
+        if (!n.confirmedSale[setName]) n.confirmedSale[setName] = {};
+        n.confirmedSale[setName][fuel] = val===null?null:(+val||0);
+      } else {
+        n.confirmedSale[fuel] = val===null?null:(+val||0);
+      }
       return n;
     });
   }
 
-  // Assign compartment in the descarga section
-  function assignDescComp(idx, set, fuel) {
-    setDescComps(p => ({ ...p, [idx]: { set, fuel } }));
+  // Migrate old descComps format {set,fuel} → new {plannedSet,plannedFuel,actualSet,actualFuel,status}
+  function migrateComp(c) {
+    if (!c) return null;
+    if (c.status) return c;
+    return { plannedSet:c.set||'', plannedFuel:c.fuel||'', actualSet:c.set||'', actualFuel:c.fuel||'', status:'delivered' };
+  }
+
+  function assignDescComp(idx, field, val) {
+    setDescComps(p => {
+      const existing = migrateComp(p[idx]) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
+      return { ...p, [idx]: { ...existing, [field]: val } };
+    });
+  }
+  function setCompStatus(idx, status) {
+    setDescComps(p => {
+      const existing = migrateComp(p[idx]) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
+      return { ...p, [idx]: { ...existing, status } };
+    });
   }
   function clearDescComp(idx) {
     setDescComps(p => { const n={...p}; delete n[idx]; return n; });
   }
 
-  // Compute descarga totals from compartment assignments
-  function computeDescargaFromComps(cistId, compsAssign) {
+  // Build descarga + pendingDescarga totals from compartment assignments
+  function computeTotalsFromComps(cistId, compsAssign) {
     const comps = cisternas[cistId] || [];
-    if (isJuta(st)) {
-      const desc = {};
-      for (const [sn, fuels] of Object.entries(JUTA_SETS)) {
-        desc[sn] = {};
-        for (const f of fuels) desc[sn][f] = 0;
+    const mkEmpty = () => {
+      if (isJuta(st)) {
+        const o={};
+        for (const [sn,fuels] of Object.entries(JUTA_SETS)) { o[sn]={}; for (const f of fuels) o[sn][f]=0; }
+        return o;
       }
-      for (const [idx, val] of Object.entries(compsAssign)) {
-        if (!val?.set || !val?.fuel) continue;
-        if (desc[val.set]) desc[val.set][val.fuel] = (desc[val.set][val.fuel]||0) + comps[parseInt(idx)];
+      return Object.fromEntries(FUELS.map(f=>[f,0]));
+    };
+    const delivered = mkEmpty(), pending = mkEmpty();
+    for (const [idx, raw] of Object.entries(compsAssign)) {
+      const c = migrateComp(raw);
+      if (!c) continue;
+      const vol = comps[parseInt(idx)] || 0;
+      if (c.status === 'delivered') {
+        const s = c.actualSet, f = c.actualFuel;
+        if (!f) continue;
+        if (isJuta(st) && s && delivered[s]) delivered[s][f] = (delivered[s][f]||0) + vol;
+        else if (!isJuta(st)) delivered[f] = (delivered[f]||0) + vol;
+      } else {
+        const s = c.plannedSet, f = c.plannedFuel;
+        if (!f) continue;
+        if (isJuta(st) && s && pending[s]) pending[s][f] = (pending[s][f]||0) + vol;
+        else if (!isJuta(st)) pending[f] = (pending[f]||0) + vol;
       }
-      return desc;
-    } else {
-      const desc = {};
-      for (const f of FUELS) desc[f] = 0;
-      for (const [idx, val] of Object.entries(compsAssign)) {
-        if (!val?.fuel) continue;
-        desc[val.fuel] = (desc[val.fuel]||0) + comps[parseInt(idx)];
-      }
-      return desc;
     }
+    return { delivered, pending };
   }
 
-  // Check if a specific compartment fits in the target set/fuel tank
-  // Space = max_capacity - morning_level - already assigned to same set/fuel
-  function compFitsCheck(idx, set, fuel) {
+  function compFitsCheck(idx, set, fuel, useActual) {
     const comps = cisternas[descCistId] || [];
     const vol = comps[idx];
     if (vol === undefined || !fuel) return null;
     const max = getMaxCap(config, st, fuel, isJuta(st) ? set : null);
-    if (max === 0) return { fits: true, space: Infinity, vol };
-    const morning = isJuta(st)
-      ? (draft.morning?.[set]?.[fuel] ?? 0)
-      : (draft.morning?.[fuel] ?? 0);
+    if (max === 0) return { fits:true, space:Infinity, vol };
+    const morning = isJuta(st) ? (draft.morning?.[set]?.[fuel]??0) : (draft.morning?.[fuel]??0);
     const alreadyAssigned = Object.entries(descComps)
-      .filter(([i, v]) => String(i) !== String(idx) && v?.fuel === fuel && (!isJuta(st) || v?.set === set))
-      .reduce((sum, [i]) => sum + (comps[parseInt(i)] || 0), 0);
+      .filter(([i,v]) => {
+        if (String(i)===String(idx)) return false;
+        const c = migrateComp(v);
+        if (!c) return false;
+        const cf = useActual ? c.actualFuel : c.plannedFuel;
+        const cs = useActual ? c.actualSet  : c.plannedSet;
+        return cf===fuel && (!isJuta(st) || cs===set) && c.status===(useActual?'delivered':'pending');
+      })
+      .reduce((sum,[i]) => sum + (comps[parseInt(i)]||0), 0);
     const space = Math.max(0, max - morning - alreadyAssigned);
-    return { fits: vol <= space, space, vol, max, morning };
+    return { fits:vol<=space, space, vol, max, morning };
   }
 
-  // Apply compartment assignments to draft
   function applyDescarga() {
     if (!descCistId) return;
-    const desc = computeDescargaFromComps(descCistId, descComps);
-    setDraft(p => ({ ...p, descarga: desc }));
+    const { delivered, pending } = computeTotalsFromComps(descCistId, descComps);
+    setDraft(p => ({ ...p, descarga: delivered, pendingDescarga: pending }));
   }
 
   function saveEntry() {
@@ -705,76 +884,130 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   }
 
   const prevDate = addDays(date, -1);
-  function calcSaleDisplay(fuel, setName) {
-    return getSale(dailyLog, st, prevDate, fuel, setName);
-  }
-
   const entryExists = !!dailyLog[st]?.[date];
   const cistList = Object.keys(cisternas);
   const descCompVols = cisternas[descCistId] || [];
-  const liveDescarga = (descCistId && Object.keys(descComps).length > 0)
-    ? computeDescargaFromComps(descCistId, descComps)
-    : null;
+  const { delivered: liveDelivered, pending: livePending } = (descCistId && Object.keys(descComps).length > 0)
+    ? computeTotalsFromComps(descCistId, descComps)
+    : { delivered: null, pending: null };
 
-  return (
-    <div>
-      {/* Date + Station + Next Cisterna */}
-      <div style={{ display:'grid', gridTemplateColumns:'170px 1fr 220px', gap:14, marginBottom:16 }} className="g3">
+  // ── Header bar ──
+  const header = (
+    <div style={{ display:'grid', gridTemplateColumns:'170px 1fr 220px', gap:14, marginBottom:16 }} className="g3">
+      <div style={S.card}>
+        <label style={S.label}>📅 Fecha</label>
+        <input style={S.input} type="date" value={date} onChange={e=>setDate(e.target.value)} />
+        <div style={{ fontSize:11, color:'#64748b', marginTop:5 }}>{dayLabel(date)}{entryExists?' ✅ Guardado':' ⬜ Sin datos'}</div>
+      </div>
+      <div style={{ ...S.card, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', padding:'12px 18px' }}>
+        {STATIONS.map(s=><button key={s} style={S.stBtn(st===s,STATION_COLORS[s])} onClick={()=>setSt(s)}>{s}{isSupplyOnly(s)?' 📦':''}</button>)}
+      </div>
+      <div style={S.card}>
+        <label style={S.label}>🚛 Próxima Cisterna</label>
+        <select style={S.input} value={nextCisterna?.[st]||''} onChange={e=>setNextCisterna(p=>({...p,[st]:e.target.value}))}>
+          <option value="">— Sin seleccionar —</option>
+          {cistList.map(id=><option key={id} value={id}>Cisterna {id} ({(cisternas[id]||[]).reduce((a,b)=>a+b,0).toLocaleString()} gal)</option>)}
+        </select>
+        <div style={{ fontSize:11, color:'#64748b', marginTop:4 }}>Para el próximo pedido</div>
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════
+  // SUPPLY-ONLY STATION (Limones, Puma Paz)
+  // ════════════════════════════════════════
+  if (isSupplyOnly(st)) {
+    return (
+      <div>
+        {header}
         <div style={S.card}>
-          <label style={S.label}>📅 Fecha</label>
-          <input style={S.input} type="date" value={date} onChange={e=>setDate(e.target.value)} />
-          <div style={{ fontSize:11, color:'#64748b', marginTop:5 }}>{dayLabel(date)}{entryExists ? ' ✅ Guardado' : ' ⬜ Sin datos'}</div>
-        </div>
-        <div style={{ ...S.card, display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', padding:'12px 18px' }}>
-          {STATIONS.map(s => <button key={s} style={S.stBtn(st===s,STATION_COLORS[s])} onClick={()=>setSt(s)}>{s}</button>)}
-        </div>
-        <div style={S.card}>
-          <label style={S.label}>🚛 Próxima Cisterna</label>
-          <select style={S.input} value={nextCisterna?.[st]||''} onChange={e=>setNextCisterna(p=>({...p,[st]:e.target.value}))}>
-            <option value="">— Sin seleccionar —</option>
-            {cistList.map(id=><option key={id} value={id}>Cisterna {id} ({(cisternas[id]||[]).reduce((a,b)=>a+b,0).toLocaleString()} gal)</option>)}
-          </select>
-          <div style={{ fontSize:11, color:'#64748b', marginTop:4 }}>Para el próximo pedido</div>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
+            <div style={S.title}>📦 Solicitud de Suministro — {st} — {dayLabel(date)}</div>
+            <button style={{ ...S.btn, background:'#1e3a5f', color:'white' }} onClick={saveEntry}>💾 Guardar</button>
+          </div>
+          <div style={S.alert('info')}>
+            ℹ️ {st} es una estación de suministro externo. Registra cuánto combustible necesitan.
+          </div>
+          <div style={{ display:'flex', gap:14, flexWrap:'wrap', marginBottom:16 }}>
+            {FUELS.map(fuel => {
+              const val = draft.requested?.[fuel] ?? null;
+              return (
+                <div key={fuel} style={{ padding:14, background:FUEL_LIGHT[fuel], borderRadius:10, borderLeft:`4px solid ${FUEL_COLORS[fuel]}`, flex:'1 1 160px' }}>
+                  <div style={{ fontWeight:700, color:FUEL_COLORS[fuel], marginBottom:10 }}>{FUEL_ICONS[fuel]} {fuel}</div>
+                  <AccumInput
+                    value={val}
+                    onChange={v=>setDraft(p=>({...p,requested:{...(p.requested||{}),[fuel]:v}}))}
+                    style={{ ...S.inputSm, borderColor:FUEL_COLORS[fuel] }}
+                    placeholder="0 gal"
+                  />
+                  {val>0 && <div style={{ fontSize:11, color:FUEL_COLORS[fuel], marginTop:4, fontWeight:600 }}>{fmt(val)} gal solicitados</div>}
+                </div>
+              );
+            })}
+          </div>
+          <label style={S.label}>Notas</label>
+          <input style={S.input} type="text" value={draft.notes||''} onChange={e=>setDraft(p=>({...p,notes:e.target.value}))} placeholder="Observaciones..." />
         </div>
       </div>
+    );
+  }
 
+  // ════════════════════════════════════════
+  // REGULAR STATION (Juticalpa, Las Delicias, La Granja)
+  // ════════════════════════════════════════
+  return (
+    <div>
+      {header}
       <div style={S.card}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:16 }}>
           <div style={S.title}>📋 Registro — {st} — {dayLabel(date)}</div>
-          <button style={{ ...S.btn, background:'#1e3a5f', color:'white' }} onClick={saveEntry}>💾 Guardar</button>
+          <button
+            style={{ ...S.btn, background:canSave?'#1e3a5f':'#94a3b8', color:'white' }}
+            onClick={canSave?saveEntry:undefined}
+            title={canSave?'':'Confirma los valores inusuales antes de guardar'}
+          >💾 Guardar</button>
         </div>
 
-        {/* Calculated sales from yesterday */}
+        {/* Anomaly warnings */}
+        {anomalies.length > 0 && (
+          <div style={{ background:'#fff7ed', border:'1px solid #fb923c', borderRadius:10, padding:14, marginBottom:14 }}>
+            <div style={{ fontWeight:700, color:'#c2410c', marginBottom:8 }}>⚠️ Valores inusuales detectados en la venta de {dayLabel(prevDate)}</div>
+            {anomalies.map(a => (
+              <div key={a.key} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6, padding:'8px 10px', background:'white', borderRadius:8, border:`1px solid ${anomalyOk[a.key]?'#86efac':'#fca5a5'}` }}>
+                <input type="checkbox" checked={!!anomalyOk[a.key]} onChange={e=>setAnomalyOk(p=>({...p,[a.key]:e.target.checked}))} style={{ cursor:'pointer' }} />
+                <span style={{ fontSize:13, flex:1 }}>
+                  {a.setName && <strong style={{ color:SET_COLORS[a.setName] }}>{a.setName} </strong>}
+                  <strong style={{ color:FUEL_COLORS[a.fuel] }}>{FUEL_ICONS[a.fuel]} {a.fuel}</strong>
+                  {' — '}<span style={{ color:'#dc2626' }}>{fmtG(a.sale)}</span>{' · '}{a.reason}
+                </span>
+                {anomalyOk[a.key] && <span style={{ color:'#059669', fontSize:12, fontWeight:600 }}>✓ Confirmado</span>}
+              </div>
+            ))}
+            {!canSave && <div style={{ fontSize:12, color:'#c2410c', marginTop:6 }}>Marca cada valor como correcto para poder guardar.</div>}
+          </div>
+        )}
+
+        {/* Implied sales from yesterday */}
         {(() => {
+          const sales = [];
           if (isJuta(st)) {
-            const hasSales = Object.entries(JUTA_SETS).some(([sn, fuels]) => fuels.some(f => getSale(dailyLog,st,prevDate,f,sn) !== null));
-            if (!hasSales) return <div style={S.alert('info')}>ℹ️ Las ventas del {dayLabel(prevDate)} se calcularán automáticamente cuando tengas los niveles de mañana de ese día y de hoy guardados.</div>;
-            return (
-              <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, marginBottom:14, border:'1px solid #86efac' }}>
-                <div style={{ fontWeight:700, color:'#065f46', marginBottom:8 }}>📊 Ventas del {dayLabel(prevDate)} (calculadas)</div>
-                <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
-                  {Object.entries(JUTA_SETS).map(([sn,fuels]) => fuels.map(f => {
-                    const s = calcSaleDisplay(f,sn);
-                    return s!==null?<span key={sn+f} style={{fontSize:13}}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]} {f}: <strong>{fmtG(s)}</strong></span>:null;
-                  }))}
-                </div>
-              </div>
-            );
+            for (const [sn,fuels] of Object.entries(JUTA_SETS)) for (const f of fuels) {
+              const s = getSale(dailyLog,st,prevDate,f,sn);
+              if (s!==null) sales.push(<span key={sn+f} style={{fontSize:13}}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]} {f}: <strong>{fmtG(s)}</strong></span>);
+            }
           } else {
-            const hasSales = FUELS.some(f => getSale(dailyLog,st,prevDate,f,null) !== null);
-            if (!hasSales) return null;
-            return (
-              <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, marginBottom:14, border:'1px solid #86efac' }}>
-                <div style={{ fontWeight:700, color:'#065f46', marginBottom:8 }}>📊 Ventas del {dayLabel(prevDate)} (calculadas)</div>
-                <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
-                  {FUELS.map(f => { const s=calcSaleDisplay(f,null); return s!==null?<span key={f} style={{fontSize:13}}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(s)}</strong></span>:null; })}
-                </div>
-              </div>
-            );
+            for (const f of FUELS) { const s=getSale(dailyLog,st,prevDate,f,null); if(s!==null) sales.push(<span key={f} style={{fontSize:13}}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(s)}</strong></span>); }
           }
+          if (!sales.length) return <div style={S.alert('info')}>ℹ️ Las ventas del {dayLabel(prevDate)} se calcularán cuando ambos días tengan niveles guardados.</div>;
+          return (
+            <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, marginBottom:14, border:'1px solid #86efac' }}>
+              <div style={{ fontWeight:700, color:'#065f46', marginBottom:8 }}>📊 Ventas del {dayLabel(prevDate)} (calculadas)</div>
+              <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>{sales}</div>
+            </div>
+          );
         })()}
 
-        {/* ── SECTION 1: Morning Levels ── */}
+        {/* ── Morning Levels ── */}
         <div style={{ marginBottom:22 }}>
           <div style={{ fontWeight:700, color:'#1e3a5f', fontSize:14, marginBottom:12, paddingBottom:6, borderBottom:'2px solid #dbeafe' }}>🌅 Niveles de la Mañana</div>
           {isJuta(st) ? (
@@ -785,14 +1018,19 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
                   {fuels.map(fuel => {
                     const max = getMaxCap(config, st, fuel, setName);
                     const m   = draft.morning?.[setName]?.[fuel];
+                    const mp  = getMinPct(config, setName);
                     const p   = m!==null && max>0 ? Math.round(m/max*100) : null;
-                    const col = p!==null ? (p<MIN_PCT*100?'#dc2626':p<WARN_PCT*100?'#d97706':'#059669') : '#94a3b8';
+                    const col = p!==null ? (p<mp*100?'#dc2626':p<WARN_PCT*100?'#d97706':'#059669') : '#94a3b8';
+                    const anom = anomalies.find(a=>a.key===`${setName}_${fuel}`);
                     return (
-                      <div key={fuel} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8 }}>
-                        <span style={{ fontWeight:600, color:FUEL_COLORS[fuel], width:72, fontSize:13, flexShrink:0 }}>{FUEL_ICONS[fuel]} {fuel}</span>
-                        <input style={{ ...S.inputSm, width:105 }} type="number" min="0" max={max} value={m??''} onChange={e=>setMorning(fuel,setName,e.target.value)} placeholder="0 gal" />
-                        <span style={{ fontSize:11, color:'#94a3b8', flexShrink:0 }}>/ {fmt(max)}</span>
-                        {p!==null && <span style={{ fontSize:11, fontWeight:700, color:col, flexShrink:0 }}>{p}%</span>}
+                      <div key={fuel} style={{ marginBottom:8 }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                          <span style={{ fontWeight:600, color:FUEL_COLORS[fuel], width:72, fontSize:13, flexShrink:0 }}>{FUEL_ICONS[fuel]} {fuel}</span>
+                          <input style={{ ...S.inputSm, width:105, borderColor:anom&&!anomalyOk[anom.key]?'#dc2626':undefined }} type="number" min="0" max={max} value={m??''} onChange={e=>setMorning(fuel,setName,e.target.value)} placeholder="0 gal" />
+                          <span style={{ fontSize:11, color:'#94a3b8', flexShrink:0 }}>/ {fmt(max)}</span>
+                          {p!==null && <span style={{ fontSize:11, fontWeight:700, color:col, flexShrink:0 }}>{p}%</span>}
+                        </div>
+                        {anom && !anomalyOk[anom.key] && <div style={{ fontSize:11, color:'#dc2626', marginTop:2, marginLeft:82 }}>⚠️ {anom.reason}</div>}
                       </div>
                     );
                   })}
@@ -804,16 +1042,19 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
               {FUELS.map(fuel => {
                 const max = getMaxCap(config, st, fuel, null);
                 const m   = draft.morning?.[fuel];
+                const mp  = getMinPct(config, null);
                 const p   = m!==null && max>0 ? Math.round(m/max*100) : null;
-                const col = p!==null ? (p<MIN_PCT*100?'#dc2626':p<WARN_PCT*100?'#d97706':'#059669') : '#94a3b8';
+                const col = p!==null ? (p<mp*100?'#dc2626':p<WARN_PCT*100?'#d97706':'#059669') : '#94a3b8';
+                const anom = anomalies.find(a=>a.key===`null_${fuel}`);
                 return (
                   <div key={fuel} style={{ padding:14, background:'#f8fafc', borderRadius:10, borderLeft:`4px solid ${FUEL_COLORS[fuel]}`, flex:'1 1 150px' }}>
                     <div style={{ fontWeight:700, color:FUEL_COLORS[fuel], marginBottom:8 }}>{FUEL_ICONS[fuel]} {fuel}</div>
-                    <input style={S.inputSm} type="number" min="0" max={max} value={m??''} onChange={e=>setMorning(fuel,null,e.target.value)} placeholder="0 gal" />
+                    <input style={{ ...S.inputSm, borderColor:anom&&!anomalyOk[anom.key]?'#dc2626':FUEL_COLORS[fuel] }} type="number" min="0" max={max} value={m??''} onChange={e=>setMorning(fuel,null,e.target.value)} placeholder="0 gal" />
                     <div style={{ fontSize:11, marginTop:4, display:'flex', justifyContent:'space-between' }}>
                       <span style={{ color:'#94a3b8' }}>Máx: {fmt(max)}</span>
                       {p!==null && <span style={{ fontWeight:700, color:col }}>{p}%</span>}
                     </div>
+                    {anom && !anomalyOk[anom.key] && <div style={{ fontSize:11, color:'#dc2626', marginTop:4 }}>⚠️ {anom.reason}</div>}
                   </div>
                 );
               })}
@@ -821,91 +1062,175 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
           )}
         </div>
 
-        {/* ── SECTION 2: Structured Descarga ── */}
+        {/* ── Confirmed Sales (from POS/pumps) ── */}
+        <details style={{ marginBottom:18 }}>
+          <summary style={{ cursor:'pointer', fontSize:13, color:'#64748b', fontWeight:600, userSelect:'none', paddingBottom:8, borderBottom:'1px solid #f1f5f9' }}>
+            🖥️ Venta confirmada desde bombas (opcional) — ayuda a detectar diferencias con el nivel de tanques
+          </summary>
+          <div style={{ marginTop:12 }}>
+            {isJuta(st) ? (
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }} className="g2">
+                {Object.entries(JUTA_SETS).map(([sn,fuels]) => (
+                  <div key={sn} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${SET_COLORS[sn]}` }}>
+                    <div style={{ fontWeight:700, color:SET_COLORS[sn], marginBottom:10, fontSize:13 }}>🛢️ {sn}</div>
+                    {fuels.map(fuel => {
+                      const v = draft.confirmedSale?.[sn]?.[fuel] ?? null;
+                      const calc = getSale(dailyLog,st,prevDate,fuel,sn);
+                      const diff = (v!==null && calc!==null) ? v - calc : null;
+                      return (
+                        <div key={fuel} style={{ marginBottom:10 }}>
+                          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                            <span style={{ fontWeight:600, color:FUEL_COLORS[fuel], width:70, fontSize:12 }}>{FUEL_ICONS[fuel]} {fuel}</span>
+                            <AccumInput value={v} onChange={val=>setConfirmedSale(fuel,sn,val)} style={{ ...S.inputSm, width:100 }} placeholder="0 gal" />
+                          </div>
+                          {diff!==null && <div style={{ fontSize:11, marginTop:2, marginLeft:78, color:Math.abs(diff)>200?'#dc2626':'#64748b' }}>
+                            vs calc: {diff>0?'+':''}{fmt(diff)} gal{Math.abs(diff)>200?' ⚠️':''}
+                          </div>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
+                {FUELS.map(fuel => {
+                  const v = draft.confirmedSale?.[fuel] ?? null;
+                  const calc = getSale(dailyLog,st,prevDate,fuel,null);
+                  const diff = (v!==null && calc!==null) ? v - calc : null;
+                  return (
+                    <div key={fuel} style={{ flex:'1 1 140px' }}>
+                      <label style={{ ...S.label, color:FUEL_COLORS[fuel] }}>{FUEL_ICONS[fuel]} {fuel} (desde bombas)</label>
+                      <AccumInput value={v} onChange={val=>setConfirmedSale(fuel,null,val)} style={{ ...S.inputSm, borderColor:FUEL_COLORS[fuel] }} placeholder="0 gal" />
+                      {diff!==null && <div style={{ fontSize:11, marginTop:2, color:Math.abs(diff)>200?'#dc2626':'#64748b' }}>
+                        vs calc: {diff>0?'+':''}{fmt(diff)} gal{Math.abs(diff)>200?' ⚠️':''}
+                      </div>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </details>
+
+        {/* ── Descarga de Cisterna (two-phase) ── */}
         <div style={{ marginBottom:16 }}>
           <div style={{ fontWeight:700, color:'#1e3a5f', fontSize:14, marginBottom:12, paddingBottom:6, borderBottom:'2px solid #dbeafe' }}>🚛 Descarga de la Cisterna</div>
 
           <div style={{ display:'grid', gridTemplateColumns:'240px 1fr', gap:14, marginBottom:14, alignItems:'end' }} className="g2">
             <div>
-              <label style={S.label}>Cisterna que descargó hoy</label>
+              <label style={S.label}>Cisterna que llegó hoy</label>
               <select style={S.input} value={descCistId} onChange={e=>{ setDescCistId(e.target.value); setDescComps({}); }}>
-                <option value="">— Sin descarga hoy —</option>
+                <option value="">— Sin cisterna hoy —</option>
                 {cistList.map(id=><option key={id} value={id}>Cisterna {id} — {(cisternas[id]||[]).length} comp · {(cisternas[id]||[]).reduce((a,b)=>a+b,0).toLocaleString()} gal</option>)}
               </select>
             </div>
-            {descCistId && (
-              <div style={S.alert('info')}>
-                ℹ️ Asigna cada compartimento a {isJuta(st) ? 'un Set y un' : 'un'} combustible. El sistema verifica que el volumen cabe en el tanque subterráneo según los niveles de la mañana.
-              </div>
-            )}
+            {descCistId && <div style={S.alert('info')}>ℹ️ Marca cada compartimento como <strong>Descargado</strong> (ya en tanques) o <strong>Pendiente</strong> (en camión, aún no descargado). Los pendientes aparecen separados en el Pronóstico.</div>}
           </div>
 
           {descCistId && (
             <div>
               <div style={{ overflowX:'auto', marginBottom:12 }}>
-                <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJuta(st)?560:460 }}>
+                <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJuta(st)?700:560 }}>
                   <thead>
                     <tr>
                       <th style={S.th}>Comp.</th>
-                      <th style={S.th}>Volumen</th>
-                      {isJuta(st) && <th style={S.th}>Set destino</th>}
-                      <th style={S.th}>Combustible</th>
+                      <th style={S.th}>Vol.</th>
+                      <th style={S.th}>Estado</th>
+                      {isJuta(st) && <th style={S.th}>Set planeado</th>}
+                      <th style={S.th}>Combustible planeado</th>
+                      {isJuta(st) && <th style={S.th}>Set real</th>}
+                      <th style={S.th}>Combustible real</th>
                       <th style={S.th}>¿Cabe?</th>
-                      <th style={{ ...S.th, width:40 }}></th>
+                      <th style={{ ...S.th, width:36 }}></th>
                     </tr>
                   </thead>
                   <tbody>
                     {descCompVols.map((vol, idx) => {
-                      const a      = descComps[idx];
-                      const curSet = isJuta(st) ? (a?.set || '') : null;
-                      const curFuel= a?.fuel || '';
-                      const cap    = (curFuel && (!isJuta(st) || curSet)) ? compFitsCheck(idx, curSet, curFuel) : null;
-                      // For Juticalpa: Regular is locked to Set 1
-                      const setOptions = isJuta(st) ? Object.keys(JUTA_SETS) : [];
-                      const fuelOptions = isJuta(st) && curSet ? JUTA_SETS[curSet] || FUELS : FUELS;
+                      const raw = descComps[idx];
+                      const c = migrateComp(raw) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
+                      const isPending = c.status === 'pending';
+                      const fuelToCheck = isPending ? c.plannedFuel : c.actualFuel;
+                      const setToCheck  = isPending ? c.plannedSet  : c.actualSet;
+                      const cap = (fuelToCheck && (!isJuta(st)||setToCheck)) ? compFitsCheck(idx, setToCheck, fuelToCheck, !isPending) : null;
+
+                      const setOpts = isJuta(st) ? Object.keys(JUTA_SETS) : [];
+                      const fuelOpts = (setName) => isJuta(st) && setName ? JUTA_SETS[setName]||FUELS : FUELS;
 
                       return (
-                        <tr key={idx} className="row-hover" style={{ background: cap && !cap.fits ? '#fff5f5' : 'white' }}>
+                        <tr key={idx} className="row-hover" style={{ background: cap&&!cap.fits?'#fff5f5': isPending?'#fffbeb':'white' }}>
                           <td style={{ ...S.td, fontWeight:700, color:'#1e3a5f' }}>C{idx+1}</td>
-                          <td style={{ ...S.td, fontWeight:700 }}>{vol.toLocaleString()} gal</td>
+                          <td style={{ ...S.td, fontWeight:700 }}>{vol.toLocaleString()}</td>
+                          <td style={S.td}>
+                            <div style={{ display:'flex', gap:4 }}>
+                              {['delivered','pending'].map(st2=>(
+                                <button key={st2} onClick={()=>setCompStatus(idx,st2)}
+                                  style={{ padding:'3px 8px', borderRadius:6, border:'none', cursor:'pointer', fontSize:11, fontWeight:700,
+                                    background: c.status===st2 ? (st2==='delivered'?'#059669':'#d97706') : '#f1f5f9',
+                                    color: c.status===st2 ? 'white' : '#64748b' }}>
+                                  {st2==='delivered'?'✓ Desc.':'⏳ Pend.'}
+                                </button>
+                              ))}
+                            </div>
+                          </td>
+                          {/* Planned set */}
                           {isJuta(st) && (
                             <td style={S.td}>
-                              <select
-                                style={{ ...S.inputSm, borderColor: curSet ? SET_COLORS[curSet] : '#d1d5db', minWidth:80 }}
-                                value={curSet}
-                                onChange={e=>assignDescComp(idx, e.target.value, '')}
-                              >
-                                <option value="">— Set —</option>
-                                {setOptions.map(s=><option key={s} value={s}>{s}</option>)}
+                              <select style={{ ...S.inputSm, borderColor:c.plannedSet?SET_COLORS[c.plannedSet]:'#d1d5db', minWidth:76 }}
+                                value={c.plannedSet}
+                                onChange={e=>assignDescComp(idx,'plannedSet',e.target.value)}>
+                                <option value="">— —</option>
+                                {setOpts.map(s=><option key={s} value={s}>{s}</option>)}
                               </select>
                             </td>
                           )}
+                          {/* Planned fuel */}
                           <td style={S.td}>
-                            <select
-                              style={{ ...S.inputSm, borderColor: curFuel ? FUEL_COLORS[curFuel] : '#d1d5db', minWidth:90 }}
-                              value={curFuel}
+                            <select style={{ ...S.inputSm, borderColor:c.plannedFuel?FUEL_COLORS[c.plannedFuel]:'#d1d5db', minWidth:86 }}
+                              value={c.plannedFuel}
                               onChange={e=>{
-                                const newFuel = e.target.value;
-                                // If Regular selected, force Set 1 for Juticalpa
-                                const newSet = isJuta(st) ? (newFuel==='Regular' ? 'Set 1' : (curSet||'')) : null;
-                                assignDescComp(idx, newSet, newFuel);
-                              }}
-                            >
-                              <option value="">— Combustible —</option>
-                              {fuelOptions.map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                                const f=e.target.value;
+                                assignDescComp(idx,'plannedFuel',f);
+                                if(f==='Regular' && isJuta(st)) assignDescComp(idx,'plannedSet','Set 1');
+                                if(!isPending) assignDescComp(idx,'actualFuel',f);
+                              }}>
+                              <option value="">— —</option>
+                              {fuelOpts(c.plannedSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
                             </select>
                           </td>
-                          <td style={{ ...S.td, minWidth:110 }}>
+                          {/* Actual set (only relevant when delivered) */}
+                          {isJuta(st) && (
+                            <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                              <select style={{ ...S.inputSm, borderColor:c.actualSet?SET_COLORS[c.actualSet]:'#d1d5db', minWidth:76 }}
+                                value={c.actualSet} disabled={isPending}
+                                onChange={e=>assignDescComp(idx,'actualSet',e.target.value)}>
+                                <option value="">— —</option>
+                                {setOpts.map(s=><option key={s} value={s}>{s}</option>)}
+                              </select>
+                            </td>
+                          )}
+                          {/* Actual fuel */}
+                          <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                            <select style={{ ...S.inputSm, borderColor:c.actualFuel?FUEL_COLORS[c.actualFuel]:'#d1d5db', minWidth:86 }}
+                              value={c.actualFuel} disabled={isPending}
+                              onChange={e=>{
+                                const f=e.target.value;
+                                assignDescComp(idx,'actualFuel',f);
+                                if(f==='Regular'&&isJuta(st)) assignDescComp(idx,'actualSet','Set 1');
+                              }}>
+                              <option value="">— —</option>
+                              {fuelOpts(c.actualSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                            </select>
+                          </td>
+                          <td style={{ ...S.td, minWidth:100 }}>
                             {cap ? (
                               <div>
-                                <span style={{ fontWeight:700, fontSize:14 }}>{cap.fits ? '✅' : '❌'}</span>
-                                <div style={{ fontSize:10, color: cap.fits ? '#059669' : '#dc2626', marginTop:1 }}>
-                                  {cap.fits ? 'Cabe' : '¡No cabe!'} · Libre: {fmt(cap.space)} gal
+                                <span style={{ fontWeight:700 }}>{cap.fits?'✅':'❌'}</span>
+                                <div style={{ fontSize:10, color:cap.fits?'#059669':'#dc2626', marginTop:1 }}>
+                                  {cap.fits?'Cabe':'¡No cabe!'} · {fmt(cap.space)} libre
                                 </div>
                               </div>
-                            ) : (
-                              <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>
-                            )}
+                            ) : <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>}
                           </td>
                           <td style={S.td}>
                             <button onClick={()=>clearDescComp(idx)} style={{ ...S.btn, background:'#f1f5f9', color:'#94a3b8', padding:'4px 8px', fontSize:11, border:'1px solid #e2e8f0' }}>✕</button>
@@ -917,54 +1242,61 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
                 </table>
               </div>
 
-              {/* Live summary of computed descarga */}
-              {liveDescarga && (
-                <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, marginBottom:12, border:'1px solid #86efac' }}>
-                  <div style={{ fontWeight:700, color:'#065f46', marginBottom:6, fontSize:13 }}>Descarga que se registrará:</div>
-                  <div style={{ display:'flex', gap:14, flexWrap:'wrap', fontSize:13 }}>
-                    {isJuta(st)
-                      ? Object.entries(JUTA_SETS).map(([sn,fuels]) => fuels.map(f => {
-                          const v = liveDescarga?.[sn]?.[f];
-                          return v>0 ? <span key={sn+f}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span> : null;
-                        }))
-                      : FUELS.map(f => { const v=liveDescarga?.[f]; return v>0?<span key={f}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(v)}</strong></span>:null; })
-                    }
-                  </div>
+              {/* Live summary */}
+              {(liveDelivered || livePending) && (
+                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:12 }} className="g2">
+                  {liveDelivered && (
+                    <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, border:'1px solid #86efac' }}>
+                      <div style={{ fontWeight:700, color:'#065f46', marginBottom:6, fontSize:12 }}>✅ Descargado en tanques:</div>
+                      <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
+                        {isJuta(st)
+                          ? Object.entries(JUTA_SETS).map(([sn,fuels])=>fuels.map(f=>{const v=liveDelivered?.[sn]?.[f];return v>0?<span key={sn+f}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>:null;}))
+                          : FUELS.map(f=>{const v=liveDelivered?.[f];return v>0?<span key={f}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(v)}</strong></span>:null;})}
+                      </div>
+                    </div>
+                  )}
+                  {livePending && (
+                    <div style={{ background:'#fffbeb', borderRadius:10, padding:12, border:'1px solid #fcd34d' }}>
+                      <div style={{ fontWeight:700, color:'#92400e', marginBottom:6, fontSize:12 }}>⏳ Pendiente por descargar:</div>
+                      <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
+                        {isJuta(st)
+                          ? Object.entries(JUTA_SETS).map(([sn,fuels])=>fuels.map(f=>{const v=livePending?.[sn]?.[f];return v>0?<span key={sn+f}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>:null;}))
+                          : FUELS.map(f=>{const v=livePending?.[f];return v>0?<span key={f}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(v)}</strong></span>:null;})}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
               <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
-                <button
-                  style={{ ...S.btn, background: Object.keys(descComps).length>0?'#059669':'#94a3b8', color:'white' }}
-                  onClick={applyDescarga}
-                  disabled={Object.keys(descComps).length===0}
-                >
+                <button style={{ ...S.btn, background:Object.keys(descComps).length>0?'#059669':'#94a3b8', color:'white' }}
+                  onClick={applyDescarga} disabled={Object.keys(descComps).length===0}>
                   ▶ Aplicar Descarga al Registro
                 </button>
                 <span style={{ fontSize:12, color:'#64748b' }}>
-                  {Object.values(descComps).filter(v=>v?.fuel).length} de {descCompVols.length} compartimentos asignados
+                  {Object.values(descComps).filter(v=>migrateComp(v)?.plannedFuel).length} de {descCompVols.length} compartimentos asignados
                 </span>
               </div>
             </div>
           )}
 
-          {/* Manual override (collapsible) */}
+          {/* Manual override */}
           <details style={{ marginTop:14 }}>
             <summary style={{ cursor:'pointer', fontSize:13, color:'#64748b', fontWeight:600, userSelect:'none' }}>
-              ✏️ {descCistId ? 'Ajuste manual de descarga' : 'Entrada manual de descarga (sin cisterna)'}
+              ✏️ {descCistId?'Ajuste manual de descarga':'Entrada manual de descarga (sin cisterna)'}
             </summary>
             <div style={{ marginTop:12 }}>
               {isJuta(st) ? (
                 <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }} className="g2">
-                  {Object.entries(JUTA_SETS).map(([setName, fuels]) => (
+                  {Object.entries(JUTA_SETS).map(([setName,fuels])=>(
                     <div key={setName} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${SET_COLORS[setName]}` }}>
                       <div style={{ fontWeight:700, color:SET_COLORS[setName], marginBottom:10, fontSize:13 }}>🛢️ {setName}</div>
-                      {fuels.map(fuel => {
-                        const d = draft.descarga?.[setName]?.[fuel] ?? 0;
+                      {fuels.map(fuel=>{
+                        const d = draft.descarga?.[setName]?.[fuel]??0;
                         return (
                           <div key={fuel} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
                             <span style={{ fontWeight:600, color:FUEL_COLORS[fuel], width:70, fontSize:12 }}>{FUEL_ICONS[fuel]} {fuel}</span>
-                            <input style={{ ...S.inputSm, width:100 }} type="number" min="0" value={d||''} onChange={e=>setDescManual(fuel,setName,e.target.value)} placeholder="0 gal" />
+                            <AccumInput value={d||null} onChange={v=>setDescManual(fuel,setName,v)} style={{ ...S.inputSm, width:100 }} placeholder="0 gal" />
                           </div>
                         );
                       })}
@@ -973,12 +1305,12 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
                 </div>
               ) : (
                 <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
-                  {FUELS.map(fuel => {
-                    const d = draft.descarga?.[fuel] ?? 0;
+                  {FUELS.map(fuel=>{
+                    const d = draft.descarga?.[fuel]??0;
                     return (
                       <div key={fuel}>
                         <label style={{ ...S.label, color:FUEL_COLORS[fuel] }}>{FUEL_ICONS[fuel]} {fuel}</label>
-                        <input style={{ ...S.inputSm, width:110 }} type="number" min="0" value={d||''} onChange={e=>setDescManual(fuel,null,e.target.value)} placeholder="0 gal" />
+                        <AccumInput value={d||null} onChange={v=>setDescManual(fuel,null,v)} style={{ ...S.inputSm, width:120 }} placeholder="0 gal" />
                       </div>
                     );
                   })}
@@ -1002,9 +1334,10 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
 // FORECAST TAB — 3-day outlook + sales history
 // ═══════════════════════════════════════════════════════════
 function ForecastTab({ config, dailyLog }) {
+  const forecastStations = STATIONS.filter(s => !isSupplyOnly(s));
   const [st, setSt]       = useState('Puma Juticalpa');
   const [today]           = useState(getTodayStr());
-  const [overrides, setOv] = useState({});  // { date: { fuel: X } }
+  const [overrides, setOv] = useState({});
 
   function setOverride(date, fuel, val) {
     setOv(p => {
@@ -1015,11 +1348,9 @@ function ForecastTab({ config, dailyLog }) {
     });
   }
 
-  // Build rows for the 3-day forecast table
-  const days = [today, addDays(today,1), addDays(today,2)];
+  const days     = [today, addDays(today,1), addDays(today,2)];
   const dayDescs = ['Día 1 – HOY (pedido antes de 12pm)', 'Día 2 – Carga del camión', 'Día 3 – Llegada estimada'];
 
-  // Get inventory keys for the station
   const invKeys = isJuta(st)
     ? Object.entries(JUTA_SETS).flatMap(([sn,fuels]) => fuels.map(f=>({set:sn,fuel:f})))
     : FUELS.map(f=>({set:null,fuel:f}));
@@ -1027,107 +1358,208 @@ function ForecastTab({ config, dailyLog }) {
   return (
     <div>
       <div style={S.stBar}>
-        {STATIONS.map(s => <button key={s} style={S.stBtn(st===s,STATION_COLORS[s])} onClick={()=>setSt(s)}>{s}</button>)}
+        {forecastStations.map(s => <button key={s} style={S.stBtn(st===s,STATION_COLORS[s])} onClick={()=>setSt(s)}>{s}</button>)}
       </div>
 
       <div style={S.alert('info')}>
-        📌 <strong>Lógica de pedido:</strong> Día 1 = hoy (orden se envía antes del mediodía). Camión carga Día 2 y llega en la tarde del Día 2 o mañana del Día 3. Debes tener mínimo {Math.round((config.minPct||50))}% al momento de entrega. El pedido llena al {Math.round((config.idealPct||90))}%.
+        📌 <strong>Lógica de pedido:</strong> Día 1 = hoy (orden antes del mediodía). Camión carga Día 2 y llega tarde del Día 2 o mañana del Día 3.
       </div>
 
-      {/* Per fuel/set card */}
       {invKeys.map(({ set: setName, fuel }) => {
-        const max       = getMaxCap(config, st, fuel, setName);
-        const morning   = getMorning(dailyLog, st, today, fuel, setName) ?? 0;
-        const desc0     = getDescarga(dailyLog, st, today, fuel, setName);
-        const minLevel  = max * (config.minPct||50)/100;
-        const idealLevel = max * (config.idealPct||90)/100;
-        const col       = FUEL_COLORS[fuel];
-        const setCol    = setName ? SET_COLORS[setName] : col;
+        const max        = getMaxCap(config, st, fuel, setName);
+        const mp         = getMinPct(config, setName);
+        const ip         = getIdealPct(config, setName);
+        const minLevel   = max * mp;
+        const idealLevel = max * ip;
+        const col        = FUEL_COLORS[fuel];
 
-        // Forecasts for each day
+        // Level breakdown for Day 1
+        const morning     = getMorning(dailyLog, st, today, fuel, setName) ?? 0;
+        const pendingYest = getPendingDescarga(dailyLog, st, addDays(today,-1), fuel, setName);
+        const descToday   = getDescarga(dailyLog, st, today, fuel, setName);
+        const pendingToday= getPendingDescarga(dailyLog, st, today, fuel, setName);
+        const cistPlanned = descToday + pendingToday;  // what's coming today (delivered + waiting)
+        const effectiveD1 = morning + pendingYest + cistPlanned;
+
+        // Forecasts
         const forecasts = days.map(d => getForecast(dailyLog, st, d, fuel, setName, overrides[d]?.[fuel]??null));
 
-        // Projected levels:
-        // after Day 1 sales: morning + desc0 - forecast[0]
-        // after Day 2 sales: above - forecast[1]
-        // at Day 3 morning (delivery): morning + desc0 - day1 - day2
-        const atDay1End  = Math.max(0, morning + desc0 - (forecasts[0]??0));
-        const atDay3Morn = Math.max(0, morning + desc0 - (forecasts[0]??0) - (forecasts[1]??0));
+        // Projections
+        const atDay1End  = Math.max(0, effectiveD1 - (forecasts[0]??0));
+        const atDay3Morn = Math.max(0, effectiveD1  - (forecasts[0]??0) - (forecasts[1]??0));
         const afterOrder = atDay3Morn + Math.max(0, idealLevel - atDay3Morn);
         const atDay3End  = Math.max(0, afterOrder - (forecasts[2]??0));
 
-        const orderAmt   = Math.max(0, Math.round(idealLevel - atDay3Morn));
+        const orderMin   = Math.max(0, Math.round(idealLevel - atDay3Morn));
+        const orderMax   = Math.max(0, Math.round(max       - atDay3Morn));
         const urgent     = atDay3Morn < minLevel && max > 0;
         const warn       = atDay3Morn < max * WARN_PCT && !urgent && max > 0;
 
+        // Historical same-weekday data (for context in the table)
+        const hist = days.map(d => {
+          const dMinus7  = addDays(d, -7);
+          const dMinus14 = addDays(d, -14);
+          return {
+            calc1: getSale(dailyLog, st, dMinus7,  fuel, setName),
+            calc2: getSale(dailyLog, st, dMinus14, fuel, setName),
+            conf1: getConfirmedSale(dailyLog, st, dMinus7,  fuel, setName),
+            conf2: getConfirmedSale(dailyLog, st, dMinus14, fuel, setName),
+          };
+        });
+
         return (
           <div key={(setName||'')+fuel} style={S.card}>
-            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:14 }}>
+            {/* Card header */}
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:14, flexWrap:'wrap' }}>
               {setName && <span style={{ background:SET_COLORS[setName], color:'white', padding:'3px 10px', borderRadius:12, fontSize:12, fontWeight:700 }}>{setName}</span>}
               <span style={{ fontWeight:700, fontSize:16, color:col }}>{FUEL_ICONS[fuel]} {fuel}</span>
-              <span style={{ fontSize:12, color:'#64748b', marginLeft:'auto' }}>Máx: {fmt(max)} gal · Mín ({config.minPct||50}%): {fmt(minLevel)} gal · Ideal ({config.idealPct||90}%): {fmt(idealLevel)} gal</span>
+              <span style={{ fontSize:11, color:'#64748b', marginLeft:'auto' }}>
+                Máx: {fmt(max)} · Mín ({Math.round(mp*100)}%): {fmt(minLevel)} · Ideal ({Math.round(ip*100)}%): {fmt(idealLevel)} gal
+              </span>
             </div>
 
             {urgent && <div style={S.alert('danger')}>🚨 Nivel proyectado al llegar el camión ({fmtG(atDay3Morn)}) está BAJO el mínimo ({fmtG(minLevel)}). Pedido URGENTE.</div>}
-            {warn   && <div style={S.alert('warn')}>⚠️ Nivel al llegar el camión ({fmtG(atDay3Morn)}) está entre el mínimo y el 65%.</div>}
+            {warn   && <div style={S.alert('warn')}>⚠️ Nivel al llegar el camión ({fmtG(atDay3Morn)}) entre mínimo y {Math.round(WARN_PCT*100)}%.</div>}
 
-            <LevelBar level={morning} max={max} color={col} />
+            <LevelBar level={morning} max={max} color={col} minPct={mp} idealPct={ip} />
 
             <div style={{ overflowX:'auto', marginTop:14 }}>
-              <table style={{ width:'100%', borderCollapse:'collapse', minWidth:500 }}>
+              <table style={{ width:'100%', borderCollapse:'collapse', minWidth:520 }}>
                 <thead>
                   <tr>
-                    <th style={{ ...S.th, textAlign:'left', minWidth:200 }}>Concepto</th>
-                    {days.map((d,i) => <th key={d} style={S.th}><div>{dayLabel(d)}</div><div style={{ fontSize:10, fontWeight:400, color:'#94a3b8' }}>{dayDescs[i]}</div></th>)}
+                    <th style={{ ...S.th, textAlign:'left', minWidth:210 }}>Concepto</th>
+                    {days.map((d,i) => (
+                      <th key={d} style={S.th}>
+                        <div>{dayLabel(d)}</div>
+                        <div style={{ fontSize:10, fontWeight:400, color:'#94a3b8' }}>{dayDescs[i]}</div>
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
+                  {/* ── Level breakdown rows (Day 1 only has actual data) ── */}
+                  <tr style={{ background:'#f0f9ff' }}>
+                    <td style={{ ...S.td, textAlign:'left', fontWeight:600, color:'#0369a1' }}>🌅 Nivel de la mañana</td>
+                    <td style={{ ...S.td, fontWeight:700 }}>{morning>0?fmt(morning):'—'}</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                  </tr>
+                  <tr style={{ background:'#fffbeb' }}>
+                    <td style={{ ...S.td, textAlign:'left', fontWeight:600, color:'#92400e' }}>⏳ Pendiente (de otro día)</td>
+                    <td style={{ ...S.td, fontWeight:pendingYest>0?700:400, color:pendingYest>0?'#d97706':'#cbd5e1' }}>{pendingYest>0?fmt(pendingYest):'—'}</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                  </tr>
+                  <tr style={{ background:'#f0fdf4' }}>
+                    <td style={{ ...S.td, textAlign:'left', fontWeight:600, color:'#065f46' }}>🚛 Cisterna planeada hoy</td>
+                    <td style={{ ...S.td, fontWeight:cistPlanned>0?700:400, color:cistPlanned>0?'#059669':'#cbd5e1' }}>{cistPlanned>0?fmt(cistPlanned):'—'}</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                    <td style={{ ...S.td, color:'#cbd5e1' }}>—</td>
+                  </tr>
+
+                  {/* ── Historical reference rows ── */}
+                  <tr style={{ background:'#faf5ff' }}>
+                    <td style={{ ...S.td, textAlign:'left', color:'#6d28d9', fontSize:12 }}>
+                      📊 Venta hace 1 sem (calc / confirmada)
+                    </td>
+                    {hist.map((h,i) => (
+                      <td key={i} style={{ ...S.td, fontSize:12 }}>
+                        {h.calc1!==null ? (
+                          <div>
+                            <span style={{ color:'#475569' }}>{fmt(h.calc1)}</span>
+                            {h.conf1!==null && (
+                              <span style={{ color:Math.abs(h.conf1-h.calc1)>200?'#dc2626':'#059669', marginLeft:4 }}>
+                                / <strong>{fmt(h.conf1)}</strong>
+                              </span>
+                            )}
+                          </div>
+                        ) : <span style={{ color:'#cbd5e1' }}>—</span>}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr style={{ background:'#faf5ff' }}>
+                    <td style={{ ...S.td, textAlign:'left', color:'#6d28d9', fontSize:12 }}>
+                      📊 Venta hace 2 sem (calc / confirmada)
+                    </td>
+                    {hist.map((h,i) => (
+                      <td key={i} style={{ ...S.td, fontSize:12 }}>
+                        {h.calc2!==null ? (
+                          <div>
+                            <span style={{ color:'#475569' }}>{fmt(h.calc2)}</span>
+                            {h.conf2!==null && (
+                              <span style={{ color:Math.abs(h.conf2-h.calc2)>200?'#dc2626':'#059669', marginLeft:4 }}>
+                                / <strong>{fmt(h.conf2)}</strong>
+                              </span>
+                            )}
+                          </div>
+                        ) : <span style={{ color:'#cbd5e1' }}>—</span>}
+                      </td>
+                    ))}
+                  </tr>
+
+                  {/* ── Forecast rows ── */}
                   <tr>
-                    <td style={{ ...S.td, textAlign:'left', fontWeight:600 }}>Venta estimada (gal) <span style={{ fontSize:10, color:'#94a3b8' }}>(editable)</span></td>
+                    <td style={{ ...S.td, textAlign:'left', fontWeight:600 }}>
+                      Venta estimada (gal) <span style={{ fontSize:10, color:'#94a3b8' }}>(editable)</span>
+                    </td>
                     {forecasts.map((f,i) => {
                       const d = days[i];
                       const ov = overrides[d]?.[fuel];
                       return (
                         <td key={d} style={S.td}>
-                          <input type="number" min="0" value={ov!==undefined&&ov!==null?ov:Math.round(f??0)}
+                          <input type="number" min="0"
+                            value={ov!==undefined&&ov!==null ? ov : Math.round(f??0)}
                             onChange={e=>setOverride(d,fuel,e.target.value)}
-                            style={{ width:80, textAlign:'center', fontSize:13, padding:'5px 6px', border:`1px solid ${ov!=null?col:'#e2e8f0'}`, borderRadius:6, background:ov!=null?`${col}10`:'white' }} />
-                          {f===null && <div style={{ fontSize:10, color:'#94a3b8' }}>Sin datos históricos</div>}
+                            style={{ width:80, textAlign:'center', fontSize:13, padding:'5px 6px',
+                              border:`1px solid ${ov!=null?col:'#e2e8f0'}`, borderRadius:6,
+                              background:ov!=null?`${col}15`:'white' }} />
+                          {f===null && <div style={{ fontSize:10, color:'#94a3b8' }}>Sin histórico</div>}
                         </td>
                       );
                     })}
                   </tr>
                   <tr style={{ background:'#f8fafc' }}>
-                    <td style={{ ...S.td, textAlign:'left', fontWeight:600 }}>Nivel al inicio del día (gal)</td>
-                    <td style={{ ...S.td, fontWeight:700 }}>{fmt(morning+desc0)}</td>
+                    <td style={{ ...S.td, textAlign:'left', fontWeight:600 }}>Nivel inicio del día (gal)</td>
+                    <td style={{ ...S.td, fontWeight:700 }}>{fmt(effectiveD1)}</td>
                     <td style={{ ...S.td, color:'#64748b' }}>{fmt(atDay1End)}</td>
-                    <td style={{ ...S.td, color: urgent?'#dc2626':warn?'#d97706':'#1e293b', fontWeight:urgent||warn?700:400 }}>{fmt(atDay3Morn)} ← al llegar</td>
+                    <td style={{ ...S.td, color:urgent?'#dc2626':warn?'#d97706':'#1e293b', fontWeight:urgent||warn?700:400 }}>
+                      {fmt(atDay3Morn)} ← al llegar
+                    </td>
                   </tr>
                   <tr>
                     <td style={{ ...S.td, textAlign:'left', fontWeight:600 }}>% Capacidad</td>
-                    <td style={S.td}>{pct(morning+desc0,max)}%</td>
+                    <td style={S.td}>{pct(effectiveD1,max)}%</td>
                     <td style={{ ...S.td, color:'#64748b' }}>{pct(atDay1End,max)}%</td>
-                    <td style={{ ...S.td, color:urgent?'#dc2626':warn?'#d97706':'#1e293b', fontWeight:urgent||warn?700:400 }}>{pct(atDay3Morn,max)}%</td>
+                    <td style={{ ...S.td, color:urgent?'#dc2626':warn?'#d97706':'#1e293b', fontWeight:urgent||warn?700:400 }}>
+                      {pct(atDay3Morn,max)}%
+                    </td>
                   </tr>
                 </tbody>
               </table>
             </div>
 
-            {/* Order recommendation */}
-            <div style={{ marginTop:14, background: urgent?'#fee2e2':warn?'#fef3c7':'#f0fdf4', borderRadius:10, padding:14, display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:12 }}>
+            {/* Order range recommendation */}
+            <div style={{ marginTop:14, background:urgent?'#fee2e2':warn?'#fef3c7':'#f0fdf4', borderRadius:10, padding:14, display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:12 }}>
               <div>
-                <div style={{ fontSize:12, color:'#64748b' }}>Al llegar: {fmt(atDay3Morn)} gal → Llenar al {config.idealPct||90}% ({fmt(idealLevel)} gal)</div>
-                <div style={{ fontWeight:700, fontSize:20, color: urgent?'#dc2626':col, marginTop:2 }}>PEDIR: {fmtG(orderAmt)}</div>
+                <div style={{ fontSize:12, color:'#64748b', marginBottom:4 }}>
+                  Al llegar: {fmt(atDay3Morn)} gal → rango de pedido para llegar a ideal–máximo
+                </div>
+                <div style={{ fontWeight:700, fontSize:20, color:urgent?'#dc2626':col }}>
+                  PEDIR: {fmtG(orderMin)} — {fmtG(orderMax)}
+                </div>
+                <div style={{ fontSize:12, color:'#64748b', marginTop:2 }}>
+                  mínimo para llegar al {Math.round(ip*100)}% ideal · máximo para llenar al 100%
+                </div>
               </div>
               <div style={{ fontSize:13, color:'#64748b', textAlign:'right' }}>
-                <div>Después del pedido: {fmt(idealLevel)} gal ({config.idealPct||90}%)</div>
+                <div>Con pedido ideal: {fmt(idealLevel)} gal ({Math.round(ip*100)}%)</div>
                 <div>Después del Día 3: {fmt(atDay3End)} gal ({pct(atDay3End,max)}%)</div>
               </div>
             </div>
 
-            {/* Holiday override helper */}
+            {/* Holiday override */}
             <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
-              <span style={{ fontSize:12, color:'#94a3b8' }}>🎉 Override por feriado:</span>
+              <span style={{ fontSize:12, color:'#94a3b8' }}>🎉 Override feriado:</span>
               {days.map(d => (
                 <label key={d} style={{ fontSize:12, color:'#64748b', display:'flex', alignItems:'center', gap:4 }}>
                   {dayLabel(d)}:
@@ -1141,32 +1573,40 @@ function ForecastTab({ config, dailyLog }) {
         );
       })}
 
-      {/* Recent sales history */}
+      {/* Recent sales history tiles */}
       <div style={S.card}>
         <div style={S.title}>📅 Ventas Recientes — {st} (últimas 2 semanas)</div>
         {invKeys.map(({ set: setName, fuel }) => {
           const col = FUEL_COLORS[fuel];
-          const rows = [];
-          for (let i = 14; i >= 1; i--) {
-            const d = addDays(today, -i);
-            const s = getSale(dailyLog, st, d, fuel, setName);
-            rows.push({ date: d, sale: s });
-          }
+          const rows = Array.from({length:14},(_,i)=>addDays(today,-(14-i))).map(d=>({
+            date:d,
+            calc: getSale(dailyLog,st,d,fuel,setName),
+            conf: getConfirmedSale(dailyLog,st,d,fuel,setName),
+          }));
           return (
             <div key={(setName||'')+fuel} style={{ marginBottom:20 }}>
               <div style={{ fontWeight:700, color:col, marginBottom:8, display:'flex', gap:8, alignItems:'center' }}>
                 {setName && <span style={{ background:SET_COLORS[setName], color:'white', padding:'2px 8px', borderRadius:10, fontSize:12 }}>{setName}</span>}
                 {FUEL_ICONS[fuel]} {fuel}
+                <span style={{ fontSize:11, color:'#94a3b8', fontWeight:400 }}>calc = niveles tanque · conf = bombas</span>
               </div>
               <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
-                {rows.map(({date:d, sale}) => (
-                  <div key={d} style={{ textAlign:'center', width:64 }}>
-                    <div style={{ fontSize:10, color:'#94a3b8', marginBottom:2 }}>{dayLabel(d)}</div>
-                    <div style={{ padding:'6px 4px', background: sale===null?'#f1f5f9':sale>0?`${col}15`:'#f1f5f9', borderRadius:6, fontSize:12, fontWeight:600, color:sale===null?'#cbd5e1':col, border:`1px solid ${sale===null?'#e2e8f0':col+'40'}` }}>
-                      {sale===null ? '—' : fmt(sale)}
+                {rows.map(({date:d,calc,conf}) => {
+                  const hasConf = conf !== null;
+                  const diff = (calc!==null && conf!==null) ? conf - calc : null;
+                  const bigDiff = diff!==null && Math.abs(diff)>200;
+                  return (
+                    <div key={d} style={{ textAlign:'center', minWidth:64 }}>
+                      <div style={{ fontSize:10, color:'#94a3b8', marginBottom:2 }}>{dayLabel(d)}</div>
+                      <div style={{ padding:'5px 4px', background:calc===null?'#f1f5f9':calc>0?`${col}15`:'#f1f5f9', borderRadius:6, fontSize:12, fontWeight:600, color:calc===null?'#cbd5e1':col, border:`1px solid ${calc===null?'#e2e8f0':col+'40'}`, minWidth:60 }}>
+                        {calc===null?'—':fmt(calc)}
+                        {hasConf && <div style={{ fontSize:10, color:bigDiff?'#dc2626':'#059669', fontWeight:700, marginTop:1 }}>
+                          ✓{fmt(conf)}{bigDiff?'⚠️':''}
+                        </div>}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           );
@@ -1210,43 +1650,61 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
   // Build targets and available space per station per (set/)fuel
   const { targets, maxSpace, recOrders } = useMemo(() => {
     const targets = {}, maxSpace = {}, recOrders = {};
-    for (const st of activeStations) {
-      targets[st]   = {};
-      maxSpace[st]  = {};
-      recOrders[st] = {};
-      const d1 = getForecast(dailyLog, st, today,          null, null, overrides[today]?.all) ;
-      const d2 = getForecast(dailyLog, st, addDays(today,1), null, null, null);
+    for (const station of activeStations) {
+      targets[station]   = {};
+      maxSpace[station]  = {};
+      recOrders[station] = {};
 
-      if (isJuta(st)) {
+      // ── Supply-only: target = what they requested today ──
+      if (isSupplyOnly(station)) {
+        const requested = dailyLog[station]?.[today]?.requested || {};
+        for (const fuel of FUELS) {
+          const amt = requested[fuel] ?? 0;
+          targets[station][fuel]  = amt;
+          maxSpace[station][fuel] = amt;
+          recOrders[station][fuel] = { order:amt, orderMin:amt, orderMax:amt, atDel:null, ideal:null, min:null, max:null, space:amt, isSupplyOnly:true };
+        }
+        continue;
+      }
+
+      if (isJuta(station)) {
         for (const [sn, fuels] of Object.entries(JUTA_SETS)) {
-          if (!targets[st][sn]) { targets[st][sn]={}; maxSpace[st][sn]={}; recOrders[st][sn]={}; }
+          if (!targets[station][sn]) { targets[station][sn]={}; maxSpace[station][sn]={}; recOrders[station][sn]={}; }
           for (const fuel of fuels) {
-            const max   = getMaxCap(config, st, fuel, sn);
-            const ideal = max * (config.idealPct||90)/100;
-            const min   = max * (config.minPct||50)/100;
-            const f1    = getForecast(dailyLog, st, today,            fuel, sn, overrides[today]?.[fuel]) ?? 0;
-            const f2    = getForecast(dailyLog, st, addDays(today,1), fuel, sn, overrides[addDays(today,1)]?.[fuel]) ?? 0;
-            const atDel = Math.max(0, (getMorning(dailyLog,st,today,fuel,sn)??0) + getDescarga(dailyLog,st,today,fuel,sn) - f1 - f2);
-            const order = Math.max(0, Math.round(ideal - atDel));
-            const space = Math.max(0, Math.round(max - atDel));
-            targets[st][sn][fuel]  = order;
-            maxSpace[st][sn][fuel] = space;
-            recOrders[st][sn]      = { ...(recOrders[st][sn]||{}), [fuel]: { order, atDel, ideal, min, max, space } };
+            const max      = getMaxCap(config, station, fuel, sn);
+            const ip       = getIdealPct(config, sn);
+            const mp       = getMinPct(config, sn);
+            const ideal    = max * ip;
+            const min      = max * mp;
+            const f1       = getForecast(dailyLog, station, today,            fuel, sn, overrides[today]?.[fuel]) ?? 0;
+            const f2       = getForecast(dailyLog, station, addDays(today,1), fuel, sn, overrides[addDays(today,1)]?.[fuel]) ?? 0;
+            const pend     = getPendingDescarga(dailyLog, station, addDays(today,-1), fuel, sn) + getPendingDescarga(dailyLog, station, today, fuel, sn);
+            const atDel    = Math.max(0, (getMorning(dailyLog,station,today,fuel,sn)??0) + getDescarga(dailyLog,station,today,fuel,sn) + pend - f1 - f2);
+            const orderMin = Math.max(0, Math.round(ideal - atDel));
+            const orderMax = Math.max(0, Math.round(max   - atDel));
+            const space    = orderMax;
+            targets[station][sn][fuel]  = orderMin;
+            maxSpace[station][sn][fuel] = space;
+            recOrders[station][sn][fuel] = { order:orderMin, orderMin, orderMax, atDel, ideal, min, max, space };
           }
         }
       } else {
         for (const fuel of FUELS) {
-          const max   = getMaxCap(config, st, fuel, null);
-          const ideal = max * (config.idealPct||90)/100;
-          const min   = max * (config.minPct||50)/100;
-          const f1    = getForecast(dailyLog, st, today,            fuel, null, overrides[today]?.[fuel]) ?? 0;
-          const f2    = getForecast(dailyLog, st, addDays(today,1), fuel, null, overrides[addDays(today,1)]?.[fuel]) ?? 0;
-          const atDel = Math.max(0, (getMorning(dailyLog,st,today,fuel,null)??0) + getDescarga(dailyLog,st,today,fuel,null) - f1 - f2);
-          const order = Math.max(0, Math.round(ideal - atDel));
-          const space = Math.max(0, Math.round(max - atDel));
-          targets[st][fuel]  = order;
-          maxSpace[st][fuel] = space;
-          recOrders[st]      = { ...(recOrders[st]||{}), [fuel]: { order, atDel, ideal, min, max, space } };
+          const max      = getMaxCap(config, station, fuel, null);
+          const ip       = getIdealPct(config, null);
+          const mp       = getMinPct(config, null);
+          const ideal    = max * ip;
+          const min      = max * mp;
+          const f1       = getForecast(dailyLog, station, today,            fuel, null, overrides[today]?.[fuel]) ?? 0;
+          const f2       = getForecast(dailyLog, station, addDays(today,1), fuel, null, overrides[addDays(today,1)]?.[fuel]) ?? 0;
+          const pend     = getPendingDescarga(dailyLog, station, addDays(today,-1), fuel, null) + getPendingDescarga(dailyLog, station, today, fuel, null);
+          const atDel    = Math.max(0, (getMorning(dailyLog,station,today,fuel,null)??0) + getDescarga(dailyLog,station,today,fuel,null) + pend - f1 - f2);
+          const orderMin = Math.max(0, Math.round(ideal - atDel));
+          const orderMax = Math.max(0, Math.round(max   - atDel));
+          const space    = orderMax;
+          targets[station][fuel]  = orderMin;
+          maxSpace[station][fuel] = space;
+          recOrders[station][fuel] = { order:orderMin, orderMin, orderMax, atDel, ideal, min, max, space };
         }
       }
     }
@@ -1358,27 +1816,33 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
       <div style={S.card}>
         <div style={S.title}>📋 Pedido Recomendado</div>
         <div style={S.alert('info')}>🎯 Objetivo: llenar al {config.idealPct||90}% al llegar la cisterna (Día 3 mañana). El nivel al llegar = nivel mañana − ventas Día 1 − ventas Día 2.</div>
-        {activeStations.map(st => {
-          const isJ = isJuta(st);
+        {activeStations.map(station => {
+          const isJ  = isJuta(station);
+          const isSO = isSupplyOnly(station);
           return (
-            <div key={st} style={{ marginBottom:20, paddingBottom:20, borderBottom:'1px solid #f1f5f9' }}>
-              <div style={{ fontWeight:700, color:STATION_COLORS[st], fontSize:15, marginBottom:12 }}>📍 {st}</div>
+            <div key={station} style={{ marginBottom:20, paddingBottom:20, borderBottom:'1px solid #f1f5f9' }}>
+              <div style={{ fontWeight:700, color:STATION_COLORS[station], fontSize:15, marginBottom:12 }}>
+                📍 {station}{isSO && <span style={{ fontWeight:400, fontSize:12, color:'#64748b', marginLeft:8 }}>(suministro externo — cantidad solicitada)</span>}
+              </div>
               {isJ ? (
                 Object.entries(JUTA_SETS).map(([sn, fuels]) => (
                   <div key={sn} style={{ marginBottom:12, padding:14, background:'#f8fafc', borderRadius:10, borderLeft:`4px solid ${SET_COLORS[sn]}` }}>
                     <div style={{ fontWeight:700, color:SET_COLORS[sn], marginBottom:10 }}>🛢️ {sn}</div>
                     <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10 }} className="g3">
                       {fuels.map(fuel => {
-                        const r = recOrders[st]?.[sn]?.[fuel];
+                        const r = recOrders[station]?.[sn]?.[fuel];
                         if (!r) return null;
-                        const col = FUEL_COLORS[fuel];
+                        const col    = FUEL_COLORS[fuel];
                         const urgent = r.atDel < r.min && r.max > 0;
                         return (
                           <div key={fuel} style={{ padding:12, background:'white', borderRadius:8, borderLeft:`3px solid ${col}` }}>
                             <div style={{ fontWeight:600, color:col, marginBottom:6 }}>{FUEL_ICONS[fuel]} {fuel}</div>
                             <div style={{ fontSize:12, color:'#64748b' }}>Al llegar: <strong style={{ color:urgent?'#dc2626':'#1e293b' }}>{fmt(r.atDel)} gal ({pct(r.atDel,r.max)}%)</strong>{urgent&&' 🚨'}</div>
-                            <div style={{ fontSize:12, color:'#64748b' }}>Espacio libre: <strong style={{ color:'#059669' }}>{fmt(r.space)} gal</strong></div>
-                            <div style={{ fontSize:16, fontWeight:700, color:col, marginTop:6, paddingTop:6, borderTop:'1px solid #f1f5f9' }}>Pedir: {fmtG(r.order)}</div>
+                            <div style={{ fontSize:12, color:'#64748b' }}>Espacio: <strong style={{ color:'#059669' }}>{fmt(r.space)} gal</strong></div>
+                            <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid #f1f5f9' }}>
+                              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:2 }}>Rango de pedido</div>
+                              <div style={{ fontSize:15, fontWeight:700, color:col }}>{fmtG(r.orderMin)} — {fmtG(r.orderMax)}</div>
+                            </div>
                           </div>
                         );
                       })}
@@ -1388,16 +1852,27 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
               ) : (
                 <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:12 }} className="g3">
                   {FUELS.map(fuel => {
-                    const r = recOrders[st]?.[fuel];
+                    const r = recOrders[station]?.[fuel];
                     if (!r) return null;
                     const col = FUEL_COLORS[fuel];
-                    const urgent = r.atDel < r.min && r.max > 0;
+                    const urgent = !isSO && r.atDel < r.min && r.max > 0;
                     return (
                       <div key={fuel} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${col}` }}>
                         <div style={{ fontWeight:600, color:col, marginBottom:6 }}>{FUEL_ICONS[fuel]} {fuel}</div>
-                        <div style={{ fontSize:12, color:'#64748b' }}>Al llegar: <strong style={{ color:urgent?'#dc2626':'#1e293b' }}>{fmt(r.atDel)} gal ({pct(r.atDel,r.max)}%)</strong>{urgent&&' 🚨'}</div>
-                        <div style={{ fontSize:12, color:'#64748b' }}>Espacio: <strong style={{ color:'#059669' }}>{fmt(r.space)} gal</strong></div>
-                        <div style={{ fontSize:16, fontWeight:700, color:col, marginTop:6, paddingTop:6, borderTop:'1px solid #f1f5f9' }}>Pedir: {fmtG(r.order)}</div>
+                        {isSO ? (
+                          <div style={{ fontSize:14, fontWeight:700, color:col, marginTop:4 }}>
+                            Solicitado: {fmtG(r.order)}
+                          </div>
+                        ) : (
+                          <>
+                            <div style={{ fontSize:12, color:'#64748b' }}>Al llegar: <strong style={{ color:urgent?'#dc2626':'#1e293b' }}>{fmt(r.atDel)} gal ({pct(r.atDel,r.max)}%)</strong>{urgent&&' 🚨'}</div>
+                            <div style={{ fontSize:12, color:'#64748b' }}>Espacio: <strong style={{ color:'#059669' }}>{fmt(r.space)} gal</strong></div>
+                            <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid #f1f5f9' }}>
+                              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:2 }}>Rango de pedido</div>
+                              <div style={{ fontSize:15, fontWeight:700, color:col }}>{fmtG(r.orderMin)} — {fmtG(r.orderMax)}</div>
+                            </div>
+                          </>
+                        )}
                       </div>
                     );
                   })}
@@ -1490,7 +1965,8 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
             <button style={{ ...S.btn, background:'#f1f5f9', color:'#475569', fontSize:13, border:'1px solid #e2e8f0', padding:'7px 14px' }} onClick={()=>window.print()} className="no-print">🖨️ Imprimir</button>
           </div>
           {activeStations.map(st => {
-            const isJ = isJuta(st);
+            const isJ  = isJuta(st);
+            const isSO = isSupplyOnly(st);
             const stTotal = isJ
               ? Object.values(actualOrder[st]||{}).reduce((t,fs)=>t+Object.values(fs).reduce((a,b)=>a+b,0),0)
               : FUELS.reduce((t,f)=>t+(actualOrder[st]?.[f]||0),0);
@@ -1504,14 +1980,21 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
                       <div style={{ fontSize:13, fontWeight:600, color:SET_COLORS[sn], marginBottom:6 }}>🛢️ {sn}</div>
                       <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
                         {fuels.map(fuel => {
-                          const ordered = actualOrder[st]?.[sn]?.[fuel]||0;
-                          const rec     = recOrders[st]?.[sn]?.[fuel]?.order||0;
-                          const diff    = ordered - rec;
+                          const ordered  = actualOrder[st]?.[sn]?.[fuel]||0;
+                          const recMin   = recOrders[st]?.[sn]?.[fuel]?.orderMin||0;
+                          const recMax   = recOrders[st]?.[sn]?.[fuel]?.orderMax||0;
+                          const inRange  = ordered>=recMin && ordered<=recMax;
+                          const col      = FUEL_COLORS[fuel];
                           return (
-                            <div key={fuel} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${FUEL_COLORS[fuel]}`, minWidth:140 }}>
-                              <div style={{ fontWeight:600, color:FUEL_COLORS[fuel] }}>{FUEL_ICONS[fuel]} {fuel}</div>
+                            <div key={fuel} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${col}`, minWidth:140 }}>
+                              <div style={{ fontWeight:600, color:col }}>{FUEL_ICONS[fuel]} {fuel}</div>
                               <div style={{ fontSize:18, fontWeight:700, marginTop:6 }}>{fmtG(ordered)}</div>
-                              <div style={{ fontSize:11, color:'#64748b' }}>Rec: {fmtG(rec)}{diff!==0&&<span style={{ color:diff>0?'#dc2626':'#059669', marginLeft:6, fontWeight:700 }}>{diff>0?'▲':'▼'}{fmtG(Math.abs(diff))}</span>}</div>
+                              <div style={{ fontSize:11, color:'#64748b' }}>
+                                Rango: {fmtG(recMin)}–{fmtG(recMax)}
+                                <span style={{ marginLeft:6, fontWeight:700, color:inRange?'#059669':ordered<recMin?'#dc2626':'#d97706' }}>
+                                  {inRange?'✅ En rango':ordered<recMin?'⚠️ Bajo mín':'⚠️ Sobre máx'}
+                                </span>
+                              </div>
                             </div>
                           );
                         })}
@@ -1521,14 +2004,26 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
                 ) : (
                   <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
                     {FUELS.map(fuel => {
-                      const ordered = actualOrder[st]?.[fuel]||0;
-                      const rec     = recOrders[st]?.[fuel]?.order||0;
-                      const diff    = ordered-rec;
+                      const ordered  = actualOrder[st]?.[fuel]||0;
+                      const recEntry = recOrders[st]?.[fuel];
+                      const recMin   = recEntry?.orderMin||0;
+                      const recMax   = recEntry?.orderMax||0;
+                      const col      = FUEL_COLORS[fuel];
+                      const inRange  = ordered>=recMin && ordered<=recMax;
                       return (
-                        <div key={fuel} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${FUEL_COLORS[fuel]}`, minWidth:140 }}>
-                          <div style={{ fontWeight:600, color:FUEL_COLORS[fuel] }}>{FUEL_ICONS[fuel]} {fuel}</div>
+                        <div key={fuel} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${col}`, minWidth:140 }}>
+                          <div style={{ fontWeight:600, color:col }}>{FUEL_ICONS[fuel]} {fuel}</div>
                           <div style={{ fontSize:18, fontWeight:700, marginTop:6 }}>{fmtG(ordered)}</div>
-                          <div style={{ fontSize:11, color:'#64748b' }}>Rec: {fmtG(rec)}{diff!==0&&<span style={{ color:diff>0?'#dc2626':'#059669', marginLeft:6, fontWeight:700 }}>{diff>0?'▲':'▼'}{fmtG(Math.abs(diff))}</span>}</div>
+                          {isSO ? (
+                            <div style={{ fontSize:11, color:'#64748b' }}>Solicitado: {fmtG(recMin)}</div>
+                          ) : (
+                            <div style={{ fontSize:11, color:'#64748b' }}>
+                              Rango: {fmtG(recMin)}–{fmtG(recMax)}
+                              <span style={{ marginLeft:6, fontWeight:700, color:inRange?'#059669':ordered<recMin?'#dc2626':'#d97706' }}>
+                                {inRange?'✅':ordered<recMin?'⚠️ Bajo':'⚠️ Sobre'}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
