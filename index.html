@@ -55,6 +55,20 @@ const IDEAL_PCT = 0.90;
 const MIN_PCT   = 0.50;
 const WARN_PCT  = 0.65;
 
+// Morning levels are read ~6:30 AM; sales accrue through the operating day.
+// Used to estimate how much a tank has drained by a given descarga time.
+const MORNING_HOUR  = 6.5;
+const DAY_END_HOUR  = 22;   // assume the day's sales spread from ~6:30 to ~22:00
+// Estimated gallons sold by a given clock time (HH:MM), prorating the day's sale
+function estSoldByTime(daySale, timeStr) {
+  if (!timeStr || !daySale) return 0;
+  const [h, m] = String(timeStr).split(':').map(Number);
+  if (isNaN(h)) return 0;
+  const t = h + (m || 0) / 60;
+  const frac = Math.max(0, Math.min(1, (t - MORNING_HOUR) / (DAY_END_HOUR - MORNING_HOUR)));
+  return daySale * frac;
+}
+
 // Per-set threshold helpers — Set 2 has lower min/ideal than Set 1
 function getMinPct(config, setName) {
   if (setName === 'Set 2') return (config.jutaSet2MinPct ?? 40) / 100;
@@ -1160,10 +1174,120 @@ function DailyLogTab({ config, dailyLog, setDailyLog, arrivals, nextCisterna, se
 // ═══════════════════════════════════════════════════════════
 // CISTERNAS TAB — track trucks & per-compartment offload status
 // ═══════════════════════════════════════════════════════════
+// Truck card — module-scoped so its identity is stable across renders
+// (a nested component would remount each keystroke, dropping focus & scrolling).
+function CisternaTruckCard({ a, st, isJ, setOpts, fuelOpts, fitOf, setComp, delTruck, updateArrival }) {
+  const total = a.comps.reduce((t,c)=>t+(c.vol||0),0);
+  const deliveredCount = a.comps.filter(c=>c.status==='delivered').length;
+  const allDone = deliveredCount === a.comps.length;
+  return (
+    <div style={{ border:`2px solid ${allDone?'#86efac':'#fcd34d'}`, borderRadius:12, padding:14, marginBottom:14, background:'white' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10, flexWrap:'wrap' }}>
+        <div style={{ fontWeight:700, fontSize:15, color:'#1e3a5f' }}>🚛 Cisterna {a.cistId}</div>
+        <div style={{ fontSize:12, color:'#64748b' }}>Llegó: <strong>{dayLabel(a.arrivalDate)}</strong></div>
+        <div style={{ fontSize:12, fontWeight:700, color:allDone?'#059669':'#d97706' }}>
+          {allDone ? '✅ Completa' : `⏳ ${deliveredCount}/${a.comps.length} descargados`}
+        </div>
+        <div style={{ fontSize:12, color:'#64748b' }}>{fmtG(total)}</div>
+        <button onClick={()=>delTruck(a.id)} style={{ ...S.btn, background:'#fee2e2', color:'#dc2626', padding:'4px 10px', fontSize:12, marginLeft:'auto' }}>🗑️ Eliminar</button>
+      </div>
+
+      {/* compartment chips */}
+      <div style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
+        {a.comps.map((c,i) => {
+          const f = c.status==='delivered'?c.actualFuel:c.plannedFuel;
+          const bg = f ? FUEL_COLORS[f] : '#cbd5e1';
+          return (
+            <div key={i} title={`C${i+1}: ${fmtG(c.vol)}`} style={{ flex:c.vol, minWidth:40, background:bg, opacity:c.status==='delivered'?1:0.45, borderRadius:6, padding:'4px 2px', textAlign:'center', color:'white', fontSize:10, fontWeight:700, border:c.status==='delivered'?'2px solid #065f46':'2px dashed #92400e' }}>
+              C{i+1}<div style={{ fontSize:9 }}>{c.vol>=1000?`${c.vol/1000}k`:c.vol}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ overflowX:'auto' }}>
+        <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJ?820:640 }}>
+          <thead><tr>
+            <th style={S.th}>Comp.</th><th style={S.th}>Vol.</th><th style={S.th}>Estado</th>
+            {isJ && <th style={S.th}>Set plan.</th>}<th style={S.th}>Comb. plan.</th>
+            {isJ && <th style={S.th}>Set real</th>}<th style={S.th}>Comb. real</th>
+            <th style={S.th}>Fecha desc.</th><th style={S.th}>Hora desc.</th><th style={S.th}>¿Cabe?</th>
+          </tr></thead>
+          <tbody>
+            {a.comps.map((c,idx) => {
+              const isPending = c.status==='pending';
+              const cap = fitOf(a.id, idx);
+              return (
+                <tr key={idx} className="row-hover" style={{ background: cap&&!cap.fits?'#fff5f5':isPending?'#fffbeb':'white' }}>
+                  <td style={{ ...S.td, fontWeight:700, color:'#1e3a5f' }}>C{idx+1}</td>
+                  <td style={{ ...S.td, fontWeight:700 }}>{fmt(c.vol)}</td>
+                  <td style={S.td}>
+                    <div style={{ display:'flex', gap:4 }}>
+                      {['delivered','pending'].map(stt => (
+                        <button key={stt} onClick={()=>setComp(a.id,idx,{status:stt})}
+                          style={{ padding:'3px 8px', borderRadius:6, border:'none', cursor:'pointer', fontSize:11, fontWeight:700,
+                            background:c.status===stt?(stt==='delivered'?'#059669':'#d97706'):'#f1f5f9', color:c.status===stt?'white':'#64748b' }}>
+                          {stt==='delivered'?'✓ Desc.':'⏳ Pend.'}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  {isJ && (
+                    <td style={S.td}>
+                      <select style={{ ...S.inputSm, borderColor:c.plannedSet?SET_COLORS[c.plannedSet]:'#d1d5db', minWidth:72 }} value={c.plannedSet} onChange={e=>setComp(a.id,idx,{plannedSet:e.target.value})}>
+                        <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </td>
+                  )}
+                  <td style={S.td}>
+                    <select style={{ ...S.inputSm, borderColor:c.plannedFuel?FUEL_COLORS[c.plannedFuel]:'#d1d5db', minWidth:84 }} value={c.plannedFuel} onChange={e=>setComp(a.id,idx,{plannedFuel:e.target.value})}>
+                      <option value="">— —</option>{fuelOpts(c.plannedSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                    </select>
+                  </td>
+                  {isJ && (
+                    <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                      <select style={{ ...S.inputSm, borderColor:c.actualSet?SET_COLORS[c.actualSet]:'#d1d5db', minWidth:72 }} value={c.actualSet} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualSet:e.target.value})}>
+                        <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </td>
+                  )}
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <select style={{ ...S.inputSm, borderColor:c.actualFuel?FUEL_COLORS[c.actualFuel]:'#d1d5db', minWidth:84 }} value={c.actualFuel} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualFuel:e.target.value})}>
+                      <option value="">— —</option>{fuelOpts(c.actualSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <input type="date" style={{ ...S.inputSm, minWidth:128 }} value={c.deliveredDate||''} disabled={isPending} onChange={e=>setComp(a.id,idx,{deliveredDate:e.target.value})} />
+                  </td>
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <input type="time" style={{ ...S.inputSm, minWidth:96 }} value={c.deliveredTime||''} disabled={isPending} onChange={e=>setComp(a.id,idx,{deliveredTime:e.target.value})} placeholder="--:--" />
+                  </td>
+                  <td style={{ ...S.td, minWidth:104 }}>
+                    {cap ? (
+                      <div><span style={{ fontWeight:700 }}>{cap.fits?'✅':'❌'}</span>
+                        <div style={{ fontSize:10, color:cap.fits?'#059669':'#dc2626' }}>{cap.fits?'Cabe':'¡No cabe!'} · {fmt(cap.space)} libre</div>
+                        {cap.timed && <div style={{ fontSize:10, color:'#0369a1' }}>~{fmt(cap.sold)} vendidos a esa hora</div>}
+                      </div>
+                    ) : <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ marginTop:8 }}>
+        <input style={{ ...S.inputSm }} type="text" placeholder="Notas de esta cisterna…" value={a.notes||''} onChange={e=>updateArrival(a.id, x=>{x.notes=e.target.value;return x;})} />
+      </div>
+    </div>
+  );
+}
+
 function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
   const [st, setSt] = useState('Puma Juticalpa');
   const [newCist, setNewCist] = useState('');
   const [newDate, setNewDate] = useState(getTodayStr());
+  const isJ = isJuta(st);
 
   const cistList = Object.keys(cisternas);
   const list = (arrivals[st] || []).slice().sort((a,b) => a.arrivalDate < b.arrivalDate ? 1 : -1);
@@ -1171,7 +1295,7 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
   function addTruck() {
     if (!newCist) { alert('Selecciona una cisterna.'); return; }
     const vols = cisternas[newCist] || [];
-    const comps = vols.map(v => ({ vol:v, plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'pending', deliveredDate:null }));
+    const comps = vols.map(v => ({ vol:v, plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'pending', deliveredDate:null, deliveredTime:'' }));
     setArrivals(p => ({ ...p, [st]: [ ...(p[st]||[]), { id:makeArrivalId(), cistId:newCist, arrivalDate:newDate, comps, notes:'' } ] }));
   }
   function updateArrival(id, fn) {
@@ -1185,23 +1309,23 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
     updateArrival(id, a => {
       const c = a.comps[idx];
       Object.assign(c, patch);
-      // Regular is locked to Set 1 for Juticalpa
       if (isJuta(st)) {
         if (c.plannedFuel==='Regular') c.plannedSet = 'Set 1';
         if (c.actualFuel==='Regular')  c.actualSet  = 'Set 1';
       }
-      // While pending, the actual mirrors the plan
-      if (c.status==='pending') { c.actualFuel = c.plannedFuel; c.actualSet = c.plannedSet; c.deliveredDate = null; }
-      // On marking delivered, default actual to plan and date to today
+      // While pending, the actual mirrors the plan and there's no delivery date/time
+      if (c.status==='pending') { c.actualFuel = c.plannedFuel; c.actualSet = c.plannedSet; c.deliveredDate = null; c.deliveredTime = ''; }
+      // On marking delivered, default actual to plan and date to the truck's arrival day
       if (patch.status==='delivered') {
         if (!c.actualFuel) { c.actualFuel = c.plannedFuel; c.actualSet = c.plannedSet; }
-        if (!c.deliveredDate) c.deliveredDate = getTodayStr();
+        if (!c.deliveredDate) c.deliveredDate = a.arrivalDate || getTodayStr();
       }
       return a;
     });
   }
 
-  // Fit check for a delivered compartment: space in target tank on its delivery date
+  // Fit check: space in the target tank at the descarga time.
+  // Morning level (~6:30 AM) minus estimated sales by that hour = level when the truck unloads.
   function fitOf(arrivalId, idx) {
     if (isSupplyOnly(st)) return null;
     const arr = list.find(a => a.id===arrivalId); if (!arr) return null;
@@ -1211,8 +1335,11 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
     if (!fuel || (isJuta(st) && !setN)) return null;
     const max = getMaxCap(config, st, fuel, isJuta(st)?setN:null);
     if (max === 0) return { fits:true, space:Infinity };
-    const refDate = c.deliveredDate || getTodayStr();
+    const refDate = c.deliveredDate || arr.arrivalDate || getTodayStr();
     const morning = getMorning(dailyLog, st, refDate, fuel, isJuta(st)?setN:null) ?? 0;
+    // estimated sales already gone by the descarga time (only when a time is given)
+    const dayForecast = getForecast(dailyLog, st, refDate, fuel, isJuta(st)?setN:null, null) ?? 0;
+    const sold = c.deliveredTime ? estSoldByTime(dayForecast, c.deliveredTime) : 0;
     // other delivered comps into the same tank on the same date
     let already = 0;
     for (const a of (arrivals[st]||[])) for (let j=0;j<a.comps.length;j++) {
@@ -1223,8 +1350,9 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
       if (isJuta(st) && oc.actualSet!==setN) continue;
       already += oc.vol||0;
     }
-    const space = Math.max(0, max - morning - already);
-    return { fits:(c.vol||0)<=space, space };
+    const levelBefore = Math.max(0, morning - sold) + already;
+    const space = Math.max(0, max - levelBefore);
+    return { fits:(c.vol||0)<=space, space, sold:Math.round(sold), timed: !!c.deliveredTime };
   }
 
   // Global pending summary across all stations
@@ -1237,111 +1365,9 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
   const pendingTrucks = list.filter(a => a.comps.some(c => c.status==='pending'));
   const doneTrucks    = list.filter(a => a.comps.every(c => c.status==='delivered'));
 
-  const setOpts = isJuta(st) ? Object.keys(JUTA_SETS) : [];
-  const fuelOpts = (setName) => isJuta(st) && setName ? (JUTA_SETS[setName]||FUELS) : FUELS;
-
-  function TruckCard({ a }) {
-    const total = a.comps.reduce((t,c)=>t+(c.vol||0),0);
-    const deliveredCount = a.comps.filter(c=>c.status==='delivered').length;
-    const allDone = deliveredCount === a.comps.length;
-    return (
-      <div style={{ border:`2px solid ${allDone?'#86efac':'#fcd34d'}`, borderRadius:12, padding:14, marginBottom:14, background:'white' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10, flexWrap:'wrap' }}>
-          <div style={{ fontWeight:700, fontSize:15, color:'#1e3a5f' }}>🚛 Cisterna {a.cistId}</div>
-          <div style={{ fontSize:12, color:'#64748b' }}>Llegó: <strong>{dayLabel(a.arrivalDate)}</strong></div>
-          <div style={{ fontSize:12, fontWeight:700, color:allDone?'#059669':'#d97706' }}>
-            {allDone ? '✅ Completa' : `⏳ ${deliveredCount}/${a.comps.length} descargados`}
-          </div>
-          <div style={{ fontSize:12, color:'#64748b' }}>{fmtG(total)}</div>
-          <button onClick={()=>delTruck(a.id)} style={{ ...S.btn, background:'#fee2e2', color:'#dc2626', padding:'4px 10px', fontSize:12, marginLeft:'auto' }}>🗑️ Eliminar</button>
-        </div>
-
-        {/* compartment chips */}
-        <div style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
-          {a.comps.map((c,i) => {
-            const f = c.status==='delivered'?c.actualFuel:c.plannedFuel;
-            const bg = f ? FUEL_COLORS[f] : '#cbd5e1';
-            return (
-              <div key={i} title={`C${i+1}: ${fmtG(c.vol)}`} style={{ flex:c.vol, minWidth:40, background:bg, opacity:c.status==='delivered'?1:0.45, borderRadius:6, padding:'4px 2px', textAlign:'center', color:'white', fontSize:10, fontWeight:700, border:c.status==='delivered'?'2px solid #065f46':'2px dashed #92400e' }}>
-                C{i+1}<div style={{ fontSize:9 }}>{c.vol>=1000?`${c.vol/1000}k`:c.vol}</div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div style={{ overflowX:'auto' }}>
-          <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJuta(st)?720:520 }}>
-            <thead><tr>
-              <th style={S.th}>Comp.</th><th style={S.th}>Vol.</th><th style={S.th}>Estado</th>
-              {isJuta(st) && <th style={S.th}>Set plan.</th>}<th style={S.th}>Comb. plan.</th>
-              {isJuta(st) && <th style={S.th}>Set real</th>}<th style={S.th}>Comb. real</th>
-              <th style={S.th}>Fecha desc.</th><th style={S.th}>¿Cabe?</th>
-            </tr></thead>
-            <tbody>
-              {a.comps.map((c,idx) => {
-                const isPending = c.status==='pending';
-                const cap = fitOf(a.id, idx);
-                return (
-                  <tr key={idx} className="row-hover" style={{ background: cap&&!cap.fits?'#fff5f5':isPending?'#fffbeb':'white' }}>
-                    <td style={{ ...S.td, fontWeight:700, color:'#1e3a5f' }}>C{idx+1}</td>
-                    <td style={{ ...S.td, fontWeight:700 }}>{fmt(c.vol)}</td>
-                    <td style={S.td}>
-                      <div style={{ display:'flex', gap:4 }}>
-                        {['delivered','pending'].map(stt => (
-                          <button key={stt} onClick={()=>setComp(a.id,idx,{status:stt})}
-                            style={{ padding:'3px 8px', borderRadius:6, border:'none', cursor:'pointer', fontSize:11, fontWeight:700,
-                              background:c.status===stt?(stt==='delivered'?'#059669':'#d97706'):'#f1f5f9', color:c.status===stt?'white':'#64748b' }}>
-                            {stt==='delivered'?'✓ Desc.':'⏳ Pend.'}
-                          </button>
-                        ))}
-                      </div>
-                    </td>
-                    {isJuta(st) && (
-                      <td style={S.td}>
-                        <select style={{ ...S.inputSm, borderColor:c.plannedSet?SET_COLORS[c.plannedSet]:'#d1d5db', minWidth:72 }} value={c.plannedSet} onChange={e=>setComp(a.id,idx,{plannedSet:e.target.value})}>
-                          <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
-                        </select>
-                      </td>
-                    )}
-                    <td style={S.td}>
-                      <select style={{ ...S.inputSm, borderColor:c.plannedFuel?FUEL_COLORS[c.plannedFuel]:'#d1d5db', minWidth:84 }} value={c.plannedFuel} onChange={e=>setComp(a.id,idx,{plannedFuel:e.target.value})}>
-                        <option value="">— —</option>{fuelOpts(c.plannedSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
-                      </select>
-                    </td>
-                    {isJuta(st) && (
-                      <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
-                        <select style={{ ...S.inputSm, borderColor:c.actualSet?SET_COLORS[c.actualSet]:'#d1d5db', minWidth:72 }} value={c.actualSet} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualSet:e.target.value})}>
-                          <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
-                        </select>
-                      </td>
-                    )}
-                    <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
-                      <select style={{ ...S.inputSm, borderColor:c.actualFuel?FUEL_COLORS[c.actualFuel]:'#d1d5db', minWidth:84 }} value={c.actualFuel} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualFuel:e.target.value})}>
-                        <option value="">— —</option>{fuelOpts(c.actualSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
-                      </select>
-                    </td>
-                    <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
-                      <input type="date" style={{ ...S.inputSm, minWidth:128 }} value={c.deliveredDate||''} disabled={isPending} onChange={e=>setComp(a.id,idx,{deliveredDate:e.target.value})} />
-                    </td>
-                    <td style={{ ...S.td, minWidth:90 }}>
-                      {cap ? (
-                        <div><span style={{ fontWeight:700 }}>{cap.fits?'✅':'❌'}</span>
-                          <div style={{ fontSize:10, color:cap.fits?'#059669':'#dc2626' }}>{cap.fits?'Cabe':'¡No cabe!'} · {fmt(cap.space)} libre</div>
-                        </div>
-                      ) : <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        <div style={{ marginTop:8 }}>
-          <input style={{ ...S.inputSm }} type="text" placeholder="Notas de esta cisterna…" value={a.notes||''} onChange={e=>updateArrival(a.id, x=>{x.notes=e.target.value;return x;})} />
-        </div>
-      </div>
-    );
-  }
+  const setOpts = isJ ? Object.keys(JUTA_SETS) : [];
+  const fuelOpts = (setName) => isJ && setName ? (JUTA_SETS[setName]||FUELS) : FUELS;
+  const cardProps = { st, isJ, setOpts, fuelOpts, fitOf, setComp, delTruck, updateArrival };
 
   return (
     <div>
@@ -1375,7 +1401,7 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
           <button style={{ ...S.btn, background:'#1e3a5f', color:'white' }} onClick={addTruck}>+ Agregar Cisterna</button>
         </div>
         <div style={{ fontSize:12, color:'#64748b', marginTop:8 }}>
-          ℹ️ Cada compartimento empieza como <strong>⏳ Pendiente</strong>. Márcalo <strong>✓ Descargado</strong> con su fecha real cuando entre al tanque — puede ser un día distinto al de llegada.
+          ℹ️ Cada compartimento empieza como <strong>⏳ Pendiente</strong>. Márcalo <strong>✓ Descargado</strong> con su fecha y <strong>hora</strong> real cuando entre al tanque — puede ser otro día. La hora ajusta el espacio disponible según las ventas estimadas hasta ese momento (los niveles se miden a las ~6:30 AM).
         </div>
       </div>
 
@@ -1384,7 +1410,7 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
         <div style={S.title}>⏳ Cisternas Pendientes ({pendingTrucks.length})</div>
         {pendingTrucks.length===0
           ? <div style={{ fontSize:13, color:'#94a3b8' }}>No hay cisternas pendientes en {st}.</div>
-          : pendingTrucks.map(a => <TruckCard key={a.id} a={a} />)}
+          : pendingTrucks.map(a => <CisternaTruckCard key={a.id} a={a} {...cardProps} />)}
       </div>
 
       {/* Completed trucks */}
@@ -1392,7 +1418,7 @@ function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
         <div style={S.title}>✅ Cisternas Completadas ({doneTrucks.length})</div>
         {doneTrucks.length===0
           ? <div style={{ fontSize:13, color:'#94a3b8' }}>Aún no hay cisternas completamente descargadas en {st}.</div>
-          : doneTrucks.map(a => <TruckCard key={a.id} a={a} />)}
+          : doneTrucks.map(a => <CisternaTruckCard key={a.id} a={a} {...cardProps} />)}
       </div>
     </div>
   );
