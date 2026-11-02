@@ -22,3 +22,6 @@ GUIA_CONFIGURACION_NUBE.md
 
 # Excel working files
 Registro_Gasolineras.xlsx
+
+# Local preview helper (not part of the app)
+.claude/

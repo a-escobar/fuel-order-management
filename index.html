@@ -30,7 +30,7 @@ const { useState, useEffect, useMemo, useCallback } = React;
 // ═══════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════
-const STATIONS    = ['Puma Juticalpa','Limones','Las Delicias','La Granja','Puma Paz'];
+const STATIONS    = ['Puma Juticalpa','Limones','Las Delicias','Puma Paz'];
 // Supply-only: we don't manage their tanks; they tell us how much they need
 const SUPPLY_ONLY = new Set(['Limones', 'Puma Paz']);
 const isSupplyOnly = s => SUPPLY_ONLY.has(s);
@@ -38,7 +38,7 @@ const FUELS       = ['Regular','Super','Diesel'];
 const DAYS_ES     = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 
 // Juticalpa underground sets and which fuels each carries
-const JUTA_SETS = { 'Set 1': ['Regular','Super','Diesel'], 'Set 2': ['Super','Diesel'] };
+const JUTA_SETS = { 'Set 1': ['Regular','Super','Diesel'], 'Set 2': ['Regular','Super','Diesel'] };
 
 const FUEL_ICONS  = { Regular:'⛽', Super:'⚡', Diesel:'🔧' };
 // Regular=Yellow, Super=Red, Diesel=Green — uniform throughout the app
@@ -47,13 +47,27 @@ const FUEL_LIGHT  = { Regular:'#fef9c3', Super:'#fee2e2', Diesel:'#d1fae5' };
 const SET_COLORS  = { 'Set 1':'#1e3a5f', 'Set 2':'#7c3aed' };
 const STATION_COLORS = {
   'Puma Juticalpa':'#1e3a5f','Limones':'#7c3aed',
-  'Las Delicias':'#db2777','La Granja':'#d97706','Puma Paz':'#059669'
+  'Las Delicias':'#db2777','Puma Paz':'#059669'
 };
 
 // Operating thresholds (defaults; per-set overrides come from config)
 const IDEAL_PCT = 0.90;
 const MIN_PCT   = 0.50;
 const WARN_PCT  = 0.65;
+
+// Morning levels are read ~6:30 AM; sales accrue through the operating day.
+// Used to estimate how much a tank has drained by a given descarga time.
+const MORNING_HOUR  = 6.5;
+const DAY_END_HOUR  = 22;   // assume the day's sales spread from ~6:30 to ~22:00
+// Estimated gallons sold by a given clock time (HH:MM), prorating the day's sale
+function estSoldByTime(daySale, timeStr) {
+  if (!timeStr || !daySale) return 0;
+  const [h, m] = String(timeStr).split(':').map(Number);
+  if (isNaN(h)) return 0;
+  const t = h + (m || 0) / 60;
+  const frac = Math.max(0, Math.min(1, (t - MORNING_HOUR) / (DAY_END_HOUR - MORNING_HOUR)));
+  return daySale * frac;
+}
 
 // Per-set threshold helpers — Set 2 has lower min/ideal than Set 1
 function getMinPct(config, setName) {
@@ -79,8 +93,8 @@ const DEFAULT_CISTERNAS = {
 const DEFAULT_ORDER_GROUPS = [
   { id:'jut', name:'Juticalpa / Limones', desc:'~2x semana. Limones se une según necesidad.',
     stations:['Puma Juticalpa','Limones'], cisternas:['923','6738','1909'] },
-  { id:'las', name:'Las Delicias / Puma Paz / La Granja', desc:'Solo Cisterna 7150, siempre compartida.',
-    stations:['Las Delicias','Puma Paz','La Granja'], cisternas:['7150'] }
+  { id:'las', name:'Las Delicias / Puma Paz', desc:'Solo Cisterna 7150, siempre compartida.',
+    stations:['Las Delicias','Puma Paz'], cisternas:['7150'] }
 ];
 
 // ═══════════════════════════════════════════════════════════
@@ -120,12 +134,6 @@ function getDescarga(log, station, date, fuel, setName) {
   if (!e) return 0;
   return isJuta(station) ? (e.descarga?.[setName]?.[fuel] ?? 0) : (e.descarga?.[fuel] ?? 0);
 }
-// Fuel that arrived in a truck but hasn't been discharged into tanks yet
-function getPendingDescarga(log, station, date, fuel, setName) {
-  const e = log[station]?.[date];
-  if (!e) return 0;
-  return isJuta(station) ? (e.pendingDescarga?.[setName]?.[fuel] ?? 0) : (e.pendingDescarga?.[fuel] ?? 0);
-}
 // Manually confirmed sale entered from the POS/pump system
 function getConfirmedSale(log, station, date, fuel, setName) {
   const e = log[station]?.[date];
@@ -161,23 +169,113 @@ function getMaxCap(config, station, fuel, setName) {
   if (isJuta(station)) return config.stationConfig[station]?.sets?.[setName]?.[fuel]?.max ?? 0;
   return config.stationConfig[station]?.fuels?.[fuel]?.max ?? 0;
 }
-// Projected level at Day 3 morning (after Day 1 + Day 2 sales consumed, before delivery)
-// Includes pending fuel from yesterday's truck (in truck, not yet discharged)
-function projAtDelivery(log, config, station, today, fuel, setName, overrides) {
-  const morning = getMorning(log, station, today, fuel, setName) ?? 0;
-  const existingDescarga = getDescarga(log, station, today, fuel, setName);
-  const pendingYesterday = getPendingDescarga(log, station, addDays(today,-1), fuel, setName);
-  const pendingToday = getPendingDescarga(log, station, today, fuel, setName);
-  const d1 = getForecast(log, station, today,           fuel, setName, overrides?.[today]?.[fuel]) ?? 0;
-  const d2 = getForecast(log, station, addDays(today,1),fuel, setName, overrides?.[addDays(today,1)]?.[fuel]) ?? 0;
-  return Math.max(0, morning + existingDescarga + pendingYesterday + pendingToday - d1 - d2);
+// ═══════════════════════════════════════════════════════════
+// CISTERNA ARRIVALS  (source of truth for trucks & compartments)
+// ═══════════════════════════════════════════════════════════
+// arrivals = { [station]: [ { id, cistId, arrivalDate, notes, comps:[
+//   { vol, plannedSet, plannedFuel, actualSet, actualFuel, status:'pending'|'delivered', deliveredDate } ] } ] }
+function makeArrivalId() { return 'a_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,7); }
+
+// Normalize an old descComp ({set,fuel}) or new comp into the planned/actual shape
+function normalizeComp(c) {
+  if (!c) return null;
+  if (c.plannedFuel !== undefined || c.actualFuel !== undefined) {
+    return { plannedSet:c.plannedSet||'', plannedFuel:c.plannedFuel||'', actualSet:c.actualSet||'', actualFuel:c.actualFuel||'', status:c.status||'delivered' };
+  }
+  return { plannedSet:c.set||'', plannedFuel:c.fuel||'', actualSet:c.set||'', actualFuel:c.fuel||'', status:c.status||'delivered' };
 }
-function projD3End(log, config, station, today, fuel, setName, overrides) {
-  const atDel = projAtDelivery(log, config, station, today, fuel, setName, overrides);
-  const max   = getMaxCap(config, station, fuel, setName);
-  const order = Math.max(0, max*IDEAL_PCT - atDel);
-  const d3    = getForecast(log, station, addDays(today,2), fuel, setName, overrides?.[addDays(today,2)]?.[fuel]) ?? 0;
-  return Math.max(0, atDel + order - d3);
+
+// Gallons still in trucks (status pending) for a station/fuel(/set), arrived on or before asOfDate
+function pendingNow(arrivals, station, fuel, setName, asOfDate) {
+  const list = arrivals?.[station] || [];
+  let t = 0;
+  for (const a of list) {
+    if (asOfDate && a.arrivalDate > asOfDate) continue;
+    for (const c of a.comps || []) {
+      if (c.status !== 'pending') continue;
+      const f = c.plannedFuel || c.actualFuel;
+      const s = c.plannedSet  || c.actualSet;
+      if (f !== fuel) continue;
+      if (isJuta(station) && s !== setName) continue;
+      t += c.vol || 0;
+    }
+  }
+  return t;
+}
+
+// Build a read-view of dailyLog whose `descarga` is derived from arrivals (delivered comps,
+// bucketed by deliveredDate). Morning levels / confirmedSale / requested / notes pass through.
+function buildLogView(dailyLog, arrivals) {
+  const view = JSON.parse(JSON.stringify(dailyLog || {}));
+  const derived = {}; // station -> date -> descarga object
+  for (const [station, list] of Object.entries(arrivals || {})) {
+    for (const a of list || []) {
+      for (const c of a.comps || []) {
+        if (c.status !== 'delivered' || !c.deliveredDate || !c.actualFuel) continue;
+        const d = c.deliveredDate;
+        derived[station] = derived[station] || {};
+        derived[station][d] = derived[station][d] || {};
+        const bucket = derived[station][d];
+        if (isJuta(station)) {
+          const s = c.actualSet; if (!s) continue;
+          bucket[s] = bucket[s] || {};
+          bucket[s][c.actualFuel] = (bucket[s][c.actualFuel] || 0) + (c.vol || 0);
+        } else {
+          bucket[c.actualFuel] = (bucket[c.actualFuel] || 0) + (c.vol || 0);
+        }
+      }
+    }
+  }
+  const stations = new Set([...Object.keys(view), ...Object.keys(derived)]);
+  for (const station of stations) {
+    view[station] = view[station] || {};
+    const dates = new Set([...Object.keys(view[station]), ...Object.keys(derived[station] || {})]);
+    for (const d of dates) {
+      view[station][d] = view[station][d] || {};
+      view[station][d].descarga = (derived[station] && derived[station][d]) ? derived[station][d] : {};
+    }
+  }
+  return view;
+}
+
+// One-time migration: turn legacy dailyLog descCistId/descComps (and any manual descarga)
+// into arrival records, so no historical delivery is lost.
+function migrateToArrivals(dailyLog, cisternas) {
+  const arrivals = {};
+  const push = (station, arr) => { arrivals[station] = arrivals[station] || []; arrivals[station].push(arr); };
+  for (const [station, days] of Object.entries(dailyLog || {})) {
+    for (const [date, entry] of Object.entries(days || {})) {
+      if (!entry) continue;
+      const hasComps = entry.descComps && Object.keys(entry.descComps).length > 0;
+      if (hasComps && entry.descCistId) {
+        const vols = cisternas[entry.descCistId] || [];
+        const comps = [];
+        for (const [idx, raw] of Object.entries(entry.descComps)) {
+          const mc = normalizeComp(raw); if (!mc) continue;
+          comps.push({ vol: vols[parseInt(idx)] ?? 0, plannedSet:mc.plannedSet, plannedFuel:mc.plannedFuel,
+            actualSet:mc.actualSet, actualFuel:mc.actualFuel, status:mc.status,
+            deliveredDate: mc.status === 'delivered' ? date : null });
+        }
+        if (comps.length) push(station, { id:makeArrivalId(), cistId:entry.descCistId, arrivalDate:date, comps, notes:'' });
+      } else if (entry.descarga) {
+        // manual-only descarga (no compartment detail) → synthetic record
+        const comps = [];
+        if (isJuta(station)) {
+          for (const [sn, fuels] of Object.entries(JUTA_SETS)) for (const f of fuels) {
+            const v = entry.descarga?.[sn]?.[f] || 0;
+            if (v > 0) comps.push({ vol:v, plannedSet:sn, plannedFuel:f, actualSet:sn, actualFuel:f, status:'delivered', deliveredDate:date });
+          }
+        } else {
+          for (const f of FUELS) {
+            const v = entry.descarga?.[f] || 0;
+            if (v > 0) comps.push({ vol:v, plannedSet:'', plannedFuel:f, actualSet:'', actualFuel:f, status:'delivered', deliveredDate:date });
+          }
+        }
+        if (comps.length) push(station, { id:makeArrivalId(), cistId: entry.descCistId || 'Manual', arrivalDate:date, comps, notes:'' });
+      }
+    }
+  }
+  return arrivals;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -296,11 +394,10 @@ function defaultConfig() {
     stationConfig: {
       'Puma Juticalpa': { type:'sets', sets: {
         'Set 1': { Regular:{max:6000}, Super:{max:6000}, Diesel:{max:8000} },
-        'Set 2': { Super:{max:7000}, Diesel:{max:7000} }
+        'Set 2': { Regular:{max:6000}, Super:{max:7000}, Diesel:{max:7000} }
       }},
       'Limones':      { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
       'Las Delicias': { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
-      'La Granja':    { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
       'Puma Paz':     { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }}
     }
   };
@@ -589,7 +686,7 @@ function ConfigTab({ config, setConfig, cisternas, setCisternas }) {
 
         {/* Non-Juticalpa stations */}
         <div style={{ marginBottom:16 }}>
-          <div style={{ fontWeight:600, color:'#64748b', fontSize:13, marginBottom:10 }}>Las Delicias · La Granja (gasolineras simples)</div>
+          <div style={{ fontWeight:600, color:'#64748b', fontSize:13, marginBottom:10 }}>Las Delicias (gasolinera simple)</div>
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
             <div>
               <label style={S.label}>Nivel mínimo (%)</label>
@@ -698,40 +795,32 @@ function ConfigTab({ config, setConfig, cisternas, setCisternas }) {
 // ═══════════════════════════════════════════════════════════
 // DAILY LOG TAB  — enter morning levels + descargas
 // ═══════════════════════════════════════════════════════════
-function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, setNextCisterna }) {
+function DailyLogTab({ config, dailyLog, setDailyLog, arrivals, nextCisterna, setNextCisterna, cisternas }) {
   const [date, setDate] = useState(getTodayStr());
   const [st, setSt] = useState('Puma Juticalpa');
   const [draft, setDraft] = useState({});
-  const [descCistId, setDescCistId] = useState('');
-  const [descComps, setDescComps] = useState({});
   const [anomalyOk, setAnomalyOk] = useState({});  // keys confirmed by operator
 
   function emptyDraft(station) {
     if (isSupplyOnly(station)) return { requested:{}, notes:'' };
     if (isJuta(station)) {
-      const morning = {}, descarga = {}, pendingDescarga = {}, confirmedSale = {};
+      const morning = {}, confirmedSale = {};
       for (const [sn, fuels] of Object.entries(JUTA_SETS)) {
-        morning[sn]={}; descarga[sn]={}; pendingDescarga[sn]={}; confirmedSale[sn]={};
-        for (const f of fuels) { morning[sn][f]=null; descarga[sn][f]=0; pendingDescarga[sn][f]=0; confirmedSale[sn][f]=null; }
+        morning[sn]={}; confirmedSale[sn]={};
+        for (const f of fuels) { morning[sn][f]=null; confirmedSale[sn][f]=null; }
       }
-      return { morning, descarga, pendingDescarga, confirmedSale, notes:'' };
+      return { morning, confirmedSale, notes:'' };
     } else {
-      const morning={}, descarga={}, pendingDescarga={}, confirmedSale={};
-      for (const f of FUELS) { morning[f]=null; descarga[f]=0; pendingDescarga[f]=0; confirmedSale[f]=null; }
-      return { morning, descarga, pendingDescarga, confirmedSale, notes:'' };
+      const morning={}, confirmedSale={};
+      for (const f of FUELS) { morning[f]=null; confirmedSale[f]=null; }
+      return { morning, confirmedSale, notes:'' };
     }
   }
 
   useEffect(() => {
     const existing = dailyLog[st]?.[date];
-    if (existing) {
-      setDraft(JSON.parse(JSON.stringify(existing)));
-      setDescCistId(existing.descCistId || '');
-      setDescComps(existing.descComps ? JSON.parse(JSON.stringify(existing.descComps)) : {});
-    } else {
-      setDraft(emptyDraft(st));
-      setDescCistId(''); setDescComps({});
-    }
+    if (existing) setDraft(JSON.parse(JSON.stringify(existing)));
+    else setDraft(emptyDraft(st));
     setAnomalyOk({});
   }, [date, st]);
 
@@ -765,16 +854,9 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   function setMorning(fuel, setName, val) {
     setDraft(p => {
       const n = JSON.parse(JSON.stringify(p));
-      if (setName) n.morning[setName][fuel] = val===''?null:+val;
+      if (!n.morning) n.morning = {};
+      if (setName) { if(!n.morning[setName]) n.morning[setName]={}; n.morning[setName][fuel] = val===''?null:+val; }
       else n.morning[fuel] = val===''?null:+val;
-      return n;
-    });
-  }
-  function setDescManual(fuel, setName, val) {
-    setDraft(p => {
-      const n = JSON.parse(JSON.stringify(p));
-      if (setName) n.descarga[setName][fuel] = val===null?0:(+val||0);
-      else n.descarga[fuel] = val===null?0:(+val||0);
       return n;
     });
   }
@@ -792,92 +874,17 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
     });
   }
 
-  // Migrate old descComps format {set,fuel} → new {plannedSet,plannedFuel,actualSet,actualFuel,status}
-  function migrateComp(c) {
-    if (!c) return null;
-    if (c.status) return c;
-    return { plannedSet:c.set||'', plannedFuel:c.fuel||'', actualSet:c.set||'', actualFuel:c.fuel||'', status:'delivered' };
-  }
-
-  function assignDescComp(idx, field, val) {
-    setDescComps(p => {
-      const existing = migrateComp(p[idx]) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
-      return { ...p, [idx]: { ...existing, [field]: val } };
-    });
-  }
-  function setCompStatus(idx, status) {
-    setDescComps(p => {
-      const existing = migrateComp(p[idx]) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
-      return { ...p, [idx]: { ...existing, status } };
-    });
-  }
-  function clearDescComp(idx) {
-    setDescComps(p => { const n={...p}; delete n[idx]; return n; });
-  }
-
-  // Build descarga + pendingDescarga totals from compartment assignments
-  function computeTotalsFromComps(cistId, compsAssign) {
-    const comps = cisternas[cistId] || [];
-    const mkEmpty = () => {
-      if (isJuta(st)) {
-        const o={};
-        for (const [sn,fuels] of Object.entries(JUTA_SETS)) { o[sn]={}; for (const f of fuels) o[sn][f]=0; }
-        return o;
-      }
-      return Object.fromEntries(FUELS.map(f=>[f,0]));
-    };
-    const delivered = mkEmpty(), pending = mkEmpty();
-    for (const [idx, raw] of Object.entries(compsAssign)) {
-      const c = migrateComp(raw);
-      if (!c) continue;
-      const vol = comps[parseInt(idx)] || 0;
-      if (c.status === 'delivered') {
-        const s = c.actualSet, f = c.actualFuel;
-        if (!f) continue;
-        if (isJuta(st) && s && delivered[s]) delivered[s][f] = (delivered[s][f]||0) + vol;
-        else if (!isJuta(st)) delivered[f] = (delivered[f]||0) + vol;
-      } else {
-        const s = c.plannedSet, f = c.plannedFuel;
-        if (!f) continue;
-        if (isJuta(st) && s && pending[s]) pending[s][f] = (pending[s][f]||0) + vol;
-        else if (!isJuta(st)) pending[f] = (pending[f]||0) + vol;
-      }
-    }
-    return { delivered, pending };
-  }
-
-  function compFitsCheck(idx, set, fuel, useActual) {
-    const comps = cisternas[descCistId] || [];
-    const vol = comps[idx];
-    if (vol === undefined || !fuel) return null;
-    const max = getMaxCap(config, st, fuel, isJuta(st) ? set : null);
-    if (max === 0) return { fits:true, space:Infinity, vol };
-    const morning = isJuta(st) ? (draft.morning?.[set]?.[fuel]??0) : (draft.morning?.[fuel]??0);
-    const alreadyAssigned = Object.entries(descComps)
-      .filter(([i,v]) => {
-        if (String(i)===String(idx)) return false;
-        const c = migrateComp(v);
-        if (!c) return false;
-        const cf = useActual ? c.actualFuel : c.plannedFuel;
-        const cs = useActual ? c.actualSet  : c.plannedSet;
-        return cf===fuel && (!isJuta(st) || cs===set) && c.status===(useActual?'delivered':'pending');
-      })
-      .reduce((sum,[i]) => sum + (comps[parseInt(i)]||0), 0);
-    const space = Math.max(0, max - morning - alreadyAssigned);
-    return { fits:vol<=space, space, vol, max, morning };
-  }
-
-  function applyDescarga() {
-    if (!descCistId) return;
-    const { delivered, pending } = computeTotalsFromComps(descCistId, descComps);
-    setDraft(p => ({ ...p, descarga: delivered, pendingDescarga: pending }));
-  }
-
+  // Save only the fields owned by this tab; descarga is derived from the Cisternas tab.
   function saveEntry() {
     setDailyLog(p => {
       const n = JSON.parse(JSON.stringify(p));
       if (!n[st]) n[st] = {};
-      n[st][date] = { ...draft, descCistId, descComps };
+      const old = n[st][date] || {};
+      if (isSupplyOnly(st)) {
+        n[st][date] = { ...old, requested: draft.requested || {}, notes: draft.notes || '' };
+      } else {
+        n[st][date] = { ...old, morning: draft.morning, confirmedSale: draft.confirmedSale, notes: draft.notes || '' };
+      }
       return n;
     });
     alert(`✅ Entrada guardada: ${st} — ${dayLabel(date)}`);
@@ -886,10 +893,20 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   const prevDate = addDays(date, -1);
   const entryExists = !!dailyLog[st]?.[date];
   const cistList = Object.keys(cisternas);
-  const descCompVols = cisternas[descCistId] || [];
-  const { delivered: liveDelivered, pending: livePending } = (descCistId && Object.keys(descComps).length > 0)
-    ? computeTotalsFromComps(descCistId, descComps)
-    : { delivered: null, pending: null };
+
+  // Delivered today (derived) + still-pending-in-trucks (as of this date), for read-only summary
+  const deliveredToday = {}, pendingTrucks = {};
+  if (!isSupplyOnly(st)) {
+    const keys = isJuta(st) ? Object.entries(JUTA_SETS).flatMap(([sn,fs])=>fs.map(f=>({sn,f}))) : FUELS.map(f=>({sn:null,f}));
+    for (const {sn,f} of keys) {
+      const dv = getDescarga(dailyLog, st, date, f, sn);
+      const pv = pendingNow(arrivals, st, f, sn, date);
+      if (dv>0) (deliveredToday[sn||'_'] = deliveredToday[sn||'_']||{})[f] = dv;
+      if (pv>0) (pendingTrucks[sn||'_'] = pendingTrucks[sn||'_']||{})[f] = pv;
+    }
+  }
+  const hasDelivered = Object.keys(deliveredToday).length>0;
+  const hasPending   = Object.keys(pendingTrucks).length>0;
 
   // ── Header bar ──
   const header = (
@@ -953,7 +970,7 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
   }
 
   // ════════════════════════════════════════
-  // REGULAR STATION (Juticalpa, Las Delicias, La Granja)
+  // REGULAR STATION (Juticalpa, Las Delicias)
   // ════════════════════════════════════════
   return (
     <div>
@@ -1113,211 +1130,34 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
           </div>
         </details>
 
-        {/* ── Descarga de Cisterna (two-phase) ── */}
+        {/* ── Descarga summary (read-only; managed in Cisternas tab) ── */}
         <div style={{ marginBottom:16 }}>
-          <div style={{ fontWeight:700, color:'#1e3a5f', fontSize:14, marginBottom:12, paddingBottom:6, borderBottom:'2px solid #dbeafe' }}>🚛 Descarga de la Cisterna</div>
-
-          <div style={{ display:'grid', gridTemplateColumns:'240px 1fr', gap:14, marginBottom:14, alignItems:'end' }} className="g2">
-            <div>
-              <label style={S.label}>Cisterna que llegó hoy</label>
-              <select style={S.input} value={descCistId} onChange={e=>{ setDescCistId(e.target.value); setDescComps({}); }}>
-                <option value="">— Sin cisterna hoy —</option>
-                {cistList.map(id=><option key={id} value={id}>Cisterna {id} — {(cisternas[id]||[]).length} comp · {(cisternas[id]||[]).reduce((a,b)=>a+b,0).toLocaleString()} gal</option>)}
-              </select>
-            </div>
-            {descCistId && <div style={S.alert('info')}>ℹ️ Marca cada compartimento como <strong>Descargado</strong> (ya en tanques) o <strong>Pendiente</strong> (en camión, aún no descargado). Los pendientes aparecen separados en el Pronóstico.</div>}
+          <div style={{ fontWeight:700, color:'#1e3a5f', fontSize:14, marginBottom:12, paddingBottom:6, borderBottom:'2px solid #dbeafe', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+            <span>🚛 Movimiento de Cisternas (hoy)</span>
+            <span style={{ fontSize:11, fontWeight:400, color:'#94a3b8' }}>Se gestiona en la pestaña 🛢️ Cisternas</span>
           </div>
-
-          {descCistId && (
-            <div>
-              <div style={{ overflowX:'auto', marginBottom:12 }}>
-                <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJuta(st)?700:560 }}>
-                  <thead>
-                    <tr>
-                      <th style={S.th}>Comp.</th>
-                      <th style={S.th}>Vol.</th>
-                      <th style={S.th}>Estado</th>
-                      {isJuta(st) && <th style={S.th}>Set planeado</th>}
-                      <th style={S.th}>Combustible planeado</th>
-                      {isJuta(st) && <th style={S.th}>Set real</th>}
-                      <th style={S.th}>Combustible real</th>
-                      <th style={S.th}>¿Cabe?</th>
-                      <th style={{ ...S.th, width:36 }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {descCompVols.map((vol, idx) => {
-                      const raw = descComps[idx];
-                      const c = migrateComp(raw) || { plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'delivered' };
-                      const isPending = c.status === 'pending';
-                      const fuelToCheck = isPending ? c.plannedFuel : c.actualFuel;
-                      const setToCheck  = isPending ? c.plannedSet  : c.actualSet;
-                      const cap = (fuelToCheck && (!isJuta(st)||setToCheck)) ? compFitsCheck(idx, setToCheck, fuelToCheck, !isPending) : null;
-
-                      const setOpts = isJuta(st) ? Object.keys(JUTA_SETS) : [];
-                      const fuelOpts = (setName) => isJuta(st) && setName ? JUTA_SETS[setName]||FUELS : FUELS;
-
-                      return (
-                        <tr key={idx} className="row-hover" style={{ background: cap&&!cap.fits?'#fff5f5': isPending?'#fffbeb':'white' }}>
-                          <td style={{ ...S.td, fontWeight:700, color:'#1e3a5f' }}>C{idx+1}</td>
-                          <td style={{ ...S.td, fontWeight:700 }}>{vol.toLocaleString()}</td>
-                          <td style={S.td}>
-                            <div style={{ display:'flex', gap:4 }}>
-                              {['delivered','pending'].map(st2=>(
-                                <button key={st2} onClick={()=>setCompStatus(idx,st2)}
-                                  style={{ padding:'3px 8px', borderRadius:6, border:'none', cursor:'pointer', fontSize:11, fontWeight:700,
-                                    background: c.status===st2 ? (st2==='delivered'?'#059669':'#d97706') : '#f1f5f9',
-                                    color: c.status===st2 ? 'white' : '#64748b' }}>
-                                  {st2==='delivered'?'✓ Desc.':'⏳ Pend.'}
-                                </button>
-                              ))}
-                            </div>
-                          </td>
-                          {/* Planned set */}
-                          {isJuta(st) && (
-                            <td style={S.td}>
-                              <select style={{ ...S.inputSm, borderColor:c.plannedSet?SET_COLORS[c.plannedSet]:'#d1d5db', minWidth:76 }}
-                                value={c.plannedSet}
-                                onChange={e=>assignDescComp(idx,'plannedSet',e.target.value)}>
-                                <option value="">— —</option>
-                                {setOpts.map(s=><option key={s} value={s}>{s}</option>)}
-                              </select>
-                            </td>
-                          )}
-                          {/* Planned fuel */}
-                          <td style={S.td}>
-                            <select style={{ ...S.inputSm, borderColor:c.plannedFuel?FUEL_COLORS[c.plannedFuel]:'#d1d5db', minWidth:86 }}
-                              value={c.plannedFuel}
-                              onChange={e=>{
-                                const f=e.target.value;
-                                assignDescComp(idx,'plannedFuel',f);
-                                if(f==='Regular' && isJuta(st)) assignDescComp(idx,'plannedSet','Set 1');
-                                if(!isPending) assignDescComp(idx,'actualFuel',f);
-                              }}>
-                              <option value="">— —</option>
-                              {fuelOpts(c.plannedSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
-                            </select>
-                          </td>
-                          {/* Actual set (only relevant when delivered) */}
-                          {isJuta(st) && (
-                            <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
-                              <select style={{ ...S.inputSm, borderColor:c.actualSet?SET_COLORS[c.actualSet]:'#d1d5db', minWidth:76 }}
-                                value={c.actualSet} disabled={isPending}
-                                onChange={e=>assignDescComp(idx,'actualSet',e.target.value)}>
-                                <option value="">— —</option>
-                                {setOpts.map(s=><option key={s} value={s}>{s}</option>)}
-                              </select>
-                            </td>
-                          )}
-                          {/* Actual fuel */}
-                          <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
-                            <select style={{ ...S.inputSm, borderColor:c.actualFuel?FUEL_COLORS[c.actualFuel]:'#d1d5db', minWidth:86 }}
-                              value={c.actualFuel} disabled={isPending}
-                              onChange={e=>{
-                                const f=e.target.value;
-                                assignDescComp(idx,'actualFuel',f);
-                                if(f==='Regular'&&isJuta(st)) assignDescComp(idx,'actualSet','Set 1');
-                              }}>
-                              <option value="">— —</option>
-                              {fuelOpts(c.actualSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
-                            </select>
-                          </td>
-                          <td style={{ ...S.td, minWidth:100 }}>
-                            {cap ? (
-                              <div>
-                                <span style={{ fontWeight:700 }}>{cap.fits?'✅':'❌'}</span>
-                                <div style={{ fontSize:10, color:cap.fits?'#059669':'#dc2626', marginTop:1 }}>
-                                  {cap.fits?'Cabe':'¡No cabe!'} · {fmt(cap.space)} libre
-                                </div>
-                              </div>
-                            ) : <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>}
-                          </td>
-                          <td style={S.td}>
-                            <button onClick={()=>clearDescComp(idx)} style={{ ...S.btn, background:'#f1f5f9', color:'#94a3b8', padding:'4px 8px', fontSize:11, border:'1px solid #e2e8f0' }}>✕</button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Live summary */}
-              {(liveDelivered || livePending) && (
-                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:12 }} className="g2">
-                  {liveDelivered && (
-                    <div style={{ background:'#f0fdf4', borderRadius:10, padding:12, border:'1px solid #86efac' }}>
-                      <div style={{ fontWeight:700, color:'#065f46', marginBottom:6, fontSize:12 }}>✅ Descargado en tanques:</div>
-                      <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
-                        {isJuta(st)
-                          ? Object.entries(JUTA_SETS).map(([sn,fuels])=>fuels.map(f=>{const v=liveDelivered?.[sn]?.[f];return v>0?<span key={sn+f}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>:null;}))
-                          : FUELS.map(f=>{const v=liveDelivered?.[f];return v>0?<span key={f}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(v)}</strong></span>:null;})}
-                      </div>
-                    </div>
-                  )}
-                  {livePending && (
-                    <div style={{ background:'#fffbeb', borderRadius:10, padding:12, border:'1px solid #fcd34d' }}>
-                      <div style={{ fontWeight:700, color:'#92400e', marginBottom:6, fontSize:12 }}>⏳ Pendiente por descargar:</div>
-                      <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
-                        {isJuta(st)
-                          ? Object.entries(JUTA_SETS).map(([sn,fuels])=>fuels.map(f=>{const v=livePending?.[sn]?.[f];return v>0?<span key={sn+f}><strong style={{color:SET_COLORS[sn]}}>{sn}</strong> {FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>:null;}))
-                          : FUELS.map(f=>{const v=livePending?.[f];return v>0?<span key={f}>{FUEL_ICONS[f]} {f}: <strong>{fmtG(v)}</strong></span>:null;})}
-                      </div>
-                    </div>
-                  )}
+          {(hasDelivered || hasPending) ? (
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="g2">
+              <div style={{ background:hasDelivered?'#f0fdf4':'#f8fafc', borderRadius:10, padding:12, border:`1px solid ${hasDelivered?'#86efac':'#e2e8f0'}` }}>
+                <div style={{ fontWeight:700, color:'#065f46', marginBottom:6, fontSize:12 }}>✅ Descargado en tanques hoy:</div>
+                <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
+                  {hasDelivered ? Object.entries(deliveredToday).flatMap(([sn,fs])=>Object.entries(fs).map(([f,v])=>
+                    <span key={sn+f}>{sn!=='_'&&<strong style={{color:SET_COLORS[sn]}}>{sn} </strong>}{FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>
+                  )) : <span style={{ color:'#94a3b8' }}>Nada descargado</span>}
                 </div>
-              )}
-
-              <div style={{ display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
-                <button style={{ ...S.btn, background:Object.keys(descComps).length>0?'#059669':'#94a3b8', color:'white' }}
-                  onClick={applyDescarga} disabled={Object.keys(descComps).length===0}>
-                  ▶ Aplicar Descarga al Registro
-                </button>
-                <span style={{ fontSize:12, color:'#64748b' }}>
-                  {Object.values(descComps).filter(v=>migrateComp(v)?.plannedFuel).length} de {descCompVols.length} compartimentos asignados
-                </span>
+              </div>
+              <div style={{ background:hasPending?'#fffbeb':'#f8fafc', borderRadius:10, padding:12, border:`1px solid ${hasPending?'#fcd34d':'#e2e8f0'}` }}>
+                <div style={{ fontWeight:700, color:'#92400e', marginBottom:6, fontSize:12 }}>⏳ En cisternas, pendiente por descargar:</div>
+                <div style={{ display:'flex', gap:10, flexWrap:'wrap', fontSize:12 }}>
+                  {hasPending ? Object.entries(pendingTrucks).flatMap(([sn,fs])=>Object.entries(fs).map(([f,v])=>
+                    <span key={sn+f}>{sn!=='_'&&<strong style={{color:SET_COLORS[sn]}}>{sn} </strong>}{FUEL_ICONS[f]}: <strong>{fmtG(v)}</strong></span>
+                  )) : <span style={{ color:'#94a3b8' }}>Nada pendiente</span>}
+                </div>
               </div>
             </div>
+          ) : (
+            <div style={S.alert('info')}>ℹ️ No hay cisternas registradas para hoy. Agrégalas y marca compartimentos en la pestaña 🛢️ Cisternas.</div>
           )}
-
-          {/* Manual override */}
-          <details style={{ marginTop:14 }}>
-            <summary style={{ cursor:'pointer', fontSize:13, color:'#64748b', fontWeight:600, userSelect:'none' }}>
-              ✏️ {descCistId?'Ajuste manual de descarga':'Entrada manual de descarga (sin cisterna)'}
-            </summary>
-            <div style={{ marginTop:12 }}>
-              {isJuta(st) ? (
-                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }} className="g2">
-                  {Object.entries(JUTA_SETS).map(([setName,fuels])=>(
-                    <div key={setName} style={{ padding:12, background:'#f8fafc', borderRadius:8, borderLeft:`3px solid ${SET_COLORS[setName]}` }}>
-                      <div style={{ fontWeight:700, color:SET_COLORS[setName], marginBottom:10, fontSize:13 }}>🛢️ {setName}</div>
-                      {fuels.map(fuel=>{
-                        const d = draft.descarga?.[setName]?.[fuel]??0;
-                        return (
-                          <div key={fuel} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
-                            <span style={{ fontWeight:600, color:FUEL_COLORS[fuel], width:70, fontSize:12 }}>{FUEL_ICONS[fuel]} {fuel}</span>
-                            <AccumInput value={d||null} onChange={v=>setDescManual(fuel,setName,v)} style={{ ...S.inputSm, width:100 }} placeholder="0 gal" />
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ display:'flex', gap:12, flexWrap:'wrap' }}>
-                  {FUELS.map(fuel=>{
-                    const d = draft.descarga?.[fuel]??0;
-                    return (
-                      <div key={fuel}>
-                        <label style={{ ...S.label, color:FUEL_COLORS[fuel] }}>{FUEL_ICONS[fuel]} {fuel}</label>
-                        <AccumInput value={d||null} onChange={v=>setDescManual(fuel,null,v)} style={{ ...S.inputSm, width:120 }} placeholder="0 gal" />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </details>
         </div>
 
         {/* Notes */}
@@ -1331,13 +1171,267 @@ function DailyLogTab({ config, dailyLog, setDailyLog, cisternas, nextCisterna, s
 }
 
 // ═══════════════════════════════════════════════════════════
+// CISTERNAS TAB — track trucks & per-compartment offload status
+// ═══════════════════════════════════════════════════════════
+// Truck card — module-scoped so its identity is stable across renders
+// (a nested component would remount each keystroke, dropping focus & scrolling).
+function CisternaTruckCard({ a, st, isJ, setOpts, fuelOpts, fitOf, setComp, delTruck, updateArrival }) {
+  const total = a.comps.reduce((t,c)=>t+(c.vol||0),0);
+  const deliveredCount = a.comps.filter(c=>c.status==='delivered').length;
+  const allDone = deliveredCount === a.comps.length;
+  return (
+    <div style={{ border:`2px solid ${allDone?'#86efac':'#fcd34d'}`, borderRadius:12, padding:14, marginBottom:14, background:'white' }}>
+      <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:10, flexWrap:'wrap' }}>
+        <div style={{ fontWeight:700, fontSize:15, color:'#1e3a5f' }}>🚛 Cisterna {a.cistId}</div>
+        <div style={{ fontSize:12, color:'#64748b' }}>Llegó: <strong>{dayLabel(a.arrivalDate)}</strong></div>
+        <div style={{ fontSize:12, fontWeight:700, color:allDone?'#059669':'#d97706' }}>
+          {allDone ? '✅ Completa' : `⏳ ${deliveredCount}/${a.comps.length} descargados`}
+        </div>
+        <div style={{ fontSize:12, color:'#64748b' }}>{fmtG(total)}</div>
+        <button onClick={()=>delTruck(a.id)} style={{ ...S.btn, background:'#fee2e2', color:'#dc2626', padding:'4px 10px', fontSize:12, marginLeft:'auto' }}>🗑️ Eliminar</button>
+      </div>
+
+      {/* compartment chips */}
+      <div style={{ display:'flex', gap:4, marginBottom:12, flexWrap:'wrap' }}>
+        {a.comps.map((c,i) => {
+          const f = c.status==='delivered'?c.actualFuel:c.plannedFuel;
+          const bg = f ? FUEL_COLORS[f] : '#cbd5e1';
+          return (
+            <div key={i} title={`C${i+1}: ${fmtG(c.vol)}`} style={{ flex:c.vol, minWidth:40, background:bg, opacity:c.status==='delivered'?1:0.45, borderRadius:6, padding:'4px 2px', textAlign:'center', color:'white', fontSize:10, fontWeight:700, border:c.status==='delivered'?'2px solid #065f46':'2px dashed #92400e' }}>
+              C{i+1}<div style={{ fontSize:9 }}>{c.vol>=1000?`${c.vol/1000}k`:c.vol}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ overflowX:'auto' }}>
+        <table style={{ width:'100%', borderCollapse:'collapse', minWidth:isJ?820:640 }}>
+          <thead><tr>
+            <th style={S.th}>Comp.</th><th style={S.th}>Vol.</th><th style={S.th}>Estado</th>
+            {isJ && <th style={S.th}>Set plan.</th>}<th style={S.th}>Comb. plan.</th>
+            {isJ && <th style={S.th}>Set real</th>}<th style={S.th}>Comb. real</th>
+            <th style={S.th}>Fecha desc.</th><th style={S.th}>Hora desc.</th><th style={S.th}>¿Cabe?</th>
+          </tr></thead>
+          <tbody>
+            {a.comps.map((c,idx) => {
+              const isPending = c.status==='pending';
+              const cap = fitOf(a.id, idx);
+              return (
+                <tr key={idx} className="row-hover" style={{ background: cap&&!cap.fits?'#fff5f5':isPending?'#fffbeb':'white' }}>
+                  <td style={{ ...S.td, fontWeight:700, color:'#1e3a5f' }}>C{idx+1}</td>
+                  <td style={{ ...S.td, fontWeight:700 }}>{fmt(c.vol)}</td>
+                  <td style={S.td}>
+                    <div style={{ display:'flex', gap:4 }}>
+                      {['delivered','pending'].map(stt => (
+                        <button key={stt} onClick={()=>setComp(a.id,idx,{status:stt})}
+                          style={{ padding:'3px 8px', borderRadius:6, border:'none', cursor:'pointer', fontSize:11, fontWeight:700,
+                            background:c.status===stt?(stt==='delivered'?'#059669':'#d97706'):'#f1f5f9', color:c.status===stt?'white':'#64748b' }}>
+                          {stt==='delivered'?'✓ Desc.':'⏳ Pend.'}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  {isJ && (
+                    <td style={S.td}>
+                      <select style={{ ...S.inputSm, borderColor:c.plannedSet?SET_COLORS[c.plannedSet]:'#d1d5db', minWidth:72 }} value={c.plannedSet} onChange={e=>setComp(a.id,idx,{plannedSet:e.target.value})}>
+                        <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </td>
+                  )}
+                  <td style={S.td}>
+                    <select style={{ ...S.inputSm, borderColor:c.plannedFuel?FUEL_COLORS[c.plannedFuel]:'#d1d5db', minWidth:84 }} value={c.plannedFuel} onChange={e=>setComp(a.id,idx,{plannedFuel:e.target.value})}>
+                      <option value="">— —</option>{fuelOpts(c.plannedSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                    </select>
+                  </td>
+                  {isJ && (
+                    <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                      <select style={{ ...S.inputSm, borderColor:c.actualSet?SET_COLORS[c.actualSet]:'#d1d5db', minWidth:72 }} value={c.actualSet} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualSet:e.target.value})}>
+                        <option value="">— —</option>{setOpts.map(s=><option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </td>
+                  )}
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <select style={{ ...S.inputSm, borderColor:c.actualFuel?FUEL_COLORS[c.actualFuel]:'#d1d5db', minWidth:84 }} value={c.actualFuel} disabled={isPending} onChange={e=>setComp(a.id,idx,{actualFuel:e.target.value})}>
+                      <option value="">— —</option>{fuelOpts(c.actualSet).map(f=><option key={f} value={f}>{FUEL_ICONS[f]} {f}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <input type="date" style={{ ...S.inputSm, minWidth:128 }} value={c.deliveredDate||''} disabled={isPending} onChange={e=>setComp(a.id,idx,{deliveredDate:e.target.value})} />
+                  </td>
+                  <td style={{ ...S.td, opacity:isPending?0.35:1 }}>
+                    <input type="time" style={{ ...S.inputSm, minWidth:96 }} value={c.deliveredTime||''} disabled={isPending} onChange={e=>setComp(a.id,idx,{deliveredTime:e.target.value})} placeholder="--:--" />
+                  </td>
+                  <td style={{ ...S.td, minWidth:104 }}>
+                    {cap ? (
+                      <div><span style={{ fontWeight:700 }}>{cap.fits?'✅':'❌'}</span>
+                        <div style={{ fontSize:10, color:cap.fits?'#059669':'#dc2626' }}>{cap.fits?'Cabe':'¡No cabe!'} · {fmt(cap.space)} libre</div>
+                        {cap.timed && <div style={{ fontSize:10, color:'#0369a1' }}>~{fmt(cap.sold)} vendidos a esa hora</div>}
+                      </div>
+                    ) : <span style={{ fontSize:11, color:'#cbd5e1' }}>—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ marginTop:8 }}>
+        <input style={{ ...S.inputSm }} type="text" placeholder="Notas de esta cisterna…" value={a.notes||''} onChange={e=>updateArrival(a.id, x=>{x.notes=e.target.value;return x;})} />
+      </div>
+    </div>
+  );
+}
+
+function CisternasTab({ config, dailyLog, cisternas, arrivals, setArrivals }) {
+  const [st, setSt] = useState('Puma Juticalpa');
+  const [newCist, setNewCist] = useState('');
+  const [newDate, setNewDate] = useState(getTodayStr());
+  const isJ = isJuta(st);
+
+  const cistList = Object.keys(cisternas);
+  const list = (arrivals[st] || []).slice().sort((a,b) => a.arrivalDate < b.arrivalDate ? 1 : -1);
+
+  function addTruck() {
+    if (!newCist) { alert('Selecciona una cisterna.'); return; }
+    const vols = cisternas[newCist] || [];
+    const comps = vols.map(v => ({ vol:v, plannedSet:'', plannedFuel:'', actualSet:'', actualFuel:'', status:'pending', deliveredDate:null, deliveredTime:'' }));
+    setArrivals(p => ({ ...p, [st]: [ ...(p[st]||[]), { id:makeArrivalId(), cistId:newCist, arrivalDate:newDate, comps, notes:'' } ] }));
+  }
+  function updateArrival(id, fn) {
+    setArrivals(p => ({ ...p, [st]: (p[st]||[]).map(a => a.id===id ? fn(JSON.parse(JSON.stringify(a))) : a) }));
+  }
+  function delTruck(id) {
+    if (!window.confirm('¿Eliminar esta cisterna del registro? (no se puede deshacer)')) return;
+    setArrivals(p => ({ ...p, [st]: (p[st]||[]).filter(a => a.id!==id) }));
+  }
+  function setComp(id, idx, patch) {
+    updateArrival(id, a => {
+      const c = a.comps[idx];
+      Object.assign(c, patch);
+      if (isJuta(st)) {
+        if (c.plannedFuel==='Regular') c.plannedSet = 'Set 1';
+        if (c.actualFuel==='Regular')  c.actualSet  = 'Set 1';
+      }
+      // While pending, the actual mirrors the plan and there's no delivery date/time
+      if (c.status==='pending') { c.actualFuel = c.plannedFuel; c.actualSet = c.plannedSet; c.deliveredDate = null; c.deliveredTime = ''; }
+      // On marking delivered, default actual to plan and date to the truck's arrival day
+      if (patch.status==='delivered') {
+        if (!c.actualFuel) { c.actualFuel = c.plannedFuel; c.actualSet = c.plannedSet; }
+        if (!c.deliveredDate) c.deliveredDate = a.arrivalDate || getTodayStr();
+      }
+      return a;
+    });
+  }
+
+  // Fit check: space in the target tank at the descarga time.
+  // Morning level (~6:30 AM) minus estimated sales by that hour = level when the truck unloads.
+  function fitOf(arrivalId, idx) {
+    if (isSupplyOnly(st)) return null;
+    const arr = list.find(a => a.id===arrivalId); if (!arr) return null;
+    const c = arr.comps[idx];
+    const fuel = c.status==='delivered' ? c.actualFuel : c.plannedFuel;
+    const setN = c.status==='delivered' ? c.actualSet  : c.plannedSet;
+    if (!fuel || (isJuta(st) && !setN)) return null;
+    const max = getMaxCap(config, st, fuel, isJuta(st)?setN:null);
+    if (max === 0) return { fits:true, space:Infinity };
+    const refDate = c.deliveredDate || arr.arrivalDate || getTodayStr();
+    const morning = getMorning(dailyLog, st, refDate, fuel, isJuta(st)?setN:null) ?? 0;
+    // estimated sales already gone by the descarga time (only when a time is given)
+    const dayForecast = getForecast(dailyLog, st, refDate, fuel, isJuta(st)?setN:null, null) ?? 0;
+    const sold = c.deliveredTime ? estSoldByTime(dayForecast, c.deliveredTime) : 0;
+    // other delivered comps into the same tank on the same date
+    let already = 0;
+    for (const a of (arrivals[st]||[])) for (let j=0;j<a.comps.length;j++) {
+      if (a.id===arrivalId && j===idx) continue;
+      const oc = a.comps[j];
+      if (oc.status!=='delivered' || oc.deliveredDate!==refDate) continue;
+      if (oc.actualFuel!==fuel) continue;
+      if (isJuta(st) && oc.actualSet!==setN) continue;
+      already += oc.vol||0;
+    }
+    const levelBefore = Math.max(0, morning - sold) + already;
+    const space = Math.max(0, max - levelBefore);
+    return { fits:(c.vol||0)<=space, space, sold:Math.round(sold), timed: !!c.deliveredTime };
+  }
+
+  // Global pending summary across all stations
+  const globalPending = STATIONS.map(s => {
+    const trucks = (arrivals[s]||[]).filter(a => a.comps.some(c => c.status==='pending'));
+    const gal = (arrivals[s]||[]).reduce((t,a)=>t+a.comps.filter(c=>c.status==='pending').reduce((x,c)=>x+(c.vol||0),0),0);
+    return { s, trucks: trucks.length, gal };
+  }).filter(x => x.trucks>0);
+
+  const pendingTrucks = list.filter(a => a.comps.some(c => c.status==='pending'));
+  const doneTrucks    = list.filter(a => a.comps.every(c => c.status==='delivered'));
+
+  const setOpts = isJ ? Object.keys(JUTA_SETS) : [];
+  const fuelOpts = (setName) => isJ && setName ? (JUTA_SETS[setName]||FUELS) : FUELS;
+  const cardProps = { st, isJ, setOpts, fuelOpts, fitOf, setComp, delTruck, updateArrival };
+
+  return (
+    <div>
+      <div style={S.stBar}>
+        {STATIONS.map(s => <button key={s} style={S.stBtn(st===s,STATION_COLORS[s])} onClick={()=>setSt(s)}>{s}{isSupplyOnly(s)?' 📦':''}</button>)}
+      </div>
+
+      {/* Global pending banner */}
+      {globalPending.length>0 && (
+        <div style={S.alert('warn')}>
+          ⏳ <strong>Cisternas pendientes por descargar:</strong>{' '}
+          {globalPending.map((g,i)=><span key={g.s}>{i>0?' · ':''}{g.s}: <strong>{g.trucks}</strong> ({fmtG(g.gal)})</span>)}
+        </div>
+      )}
+
+      {/* Add truck */}
+      <div style={S.card}>
+        <div style={S.title}>➕ Registrar Cisterna que Llegó — {st}</div>
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 180px auto', gap:12, alignItems:'end' }} className="g3">
+          <div>
+            <label style={S.label}>Cisterna</label>
+            <select style={S.input} value={newCist} onChange={e=>setNewCist(e.target.value)}>
+              <option value="">— Selecciona —</option>
+              {cistList.map(id=><option key={id} value={id}>Cisterna {id} — {(cisternas[id]||[]).length} comp · {(cisternas[id]||[]).reduce((a,b)=>a+b,0).toLocaleString()} gal</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={S.label}>Fecha de llegada</label>
+            <input style={S.input} type="date" value={newDate} onChange={e=>setNewDate(e.target.value)} />
+          </div>
+          <button style={{ ...S.btn, background:'#1e3a5f', color:'white' }} onClick={addTruck}>+ Agregar Cisterna</button>
+        </div>
+        <div style={{ fontSize:12, color:'#64748b', marginTop:8 }}>
+          ℹ️ Cada compartimento empieza como <strong>⏳ Pendiente</strong>. Márcalo <strong>✓ Descargado</strong> con su fecha y <strong>hora</strong> real cuando entre al tanque — puede ser otro día. La hora ajusta el espacio disponible según las ventas estimadas hasta ese momento (los niveles se miden a las ~6:30 AM).
+        </div>
+      </div>
+
+      {/* Pending trucks */}
+      <div style={S.card}>
+        <div style={S.title}>⏳ Cisternas Pendientes ({pendingTrucks.length})</div>
+        {pendingTrucks.length===0
+          ? <div style={{ fontSize:13, color:'#94a3b8' }}>No hay cisternas pendientes en {st}.</div>
+          : pendingTrucks.map(a => <CisternaTruckCard key={a.id} a={a} {...cardProps} />)}
+      </div>
+
+      {/* Completed trucks */}
+      <div style={S.card}>
+        <div style={S.title}>✅ Cisternas Completadas ({doneTrucks.length})</div>
+        {doneTrucks.length===0
+          ? <div style={{ fontSize:13, color:'#94a3b8' }}>Aún no hay cisternas completamente descargadas en {st}.</div>
+          : doneTrucks.map(a => <CisternaTruckCard key={a.id} a={a} {...cardProps} />)}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
 // FORECAST TAB — 3-day outlook + sales history
 // ═══════════════════════════════════════════════════════════
-function ForecastTab({ config, dailyLog }) {
+function ForecastTab({ config, dailyLog, arrivals }) {
   const forecastStations = STATIONS.filter(s => !isSupplyOnly(s));
   const [st, setSt]       = useState('Puma Juticalpa');
   const [today]           = useState(getTodayStr());
   const [overrides, setOv] = useState({});
+  const [orders, setOrders] = useState({});  // { '<set>_<fuel>': { o1, o2 } }
 
   function setOverride(date, fuel, val) {
     setOv(p => {
@@ -1346,6 +1440,9 @@ function ForecastTab({ config, dailyLog }) {
       n[date][fuel] = val===''?null:+val;
       return n;
     });
+  }
+  function setOrder(key, which, val) {
+    setOrders(p => ({ ...p, [key]: { ...(p[key]||{}), [which]: val==='' ? null : +val } }));
   }
 
   const days     = [today, addDays(today,1), addDays(today,2)];
@@ -1373,18 +1470,19 @@ function ForecastTab({ config, dailyLog }) {
         const idealLevel = max * ip;
         const col        = FUEL_COLORS[fuel];
 
-        // Level breakdown for Day 1
+        // Level breakdown for Day 1 (from arrivals = source of truth)
         const morning     = getMorning(dailyLog, st, today, fuel, setName) ?? 0;
-        const pendingYest = getPendingDescarga(dailyLog, st, addDays(today,-1), fuel, setName);
         const descToday   = getDescarga(dailyLog, st, today, fuel, setName);
-        const pendingToday= getPendingDescarga(dailyLog, st, today, fuel, setName);
-        const cistPlanned = descToday + pendingToday;  // what's coming today (delivered + waiting)
-        const effectiveD1 = morning + pendingYest + cistPlanned;
+        const pendTotal   = pendingNow(arrivals, st, fuel, setName, today);                 // all pending in trucks now
+        const pendingYest = pendingNow(arrivals, st, fuel, setName, addDays(today,-1));      // arrived a prior day
+        const cistPlanned = descToday + Math.max(0, pendTotal - pendingYest);               // arrived/handled today
+        const effectiveD1 = morning + descToday + pendTotal;
 
-        // Forecasts
+        // Forecasts (4 days so we can model Day-2's order landing on Day 4)
         const forecasts = days.map(d => getForecast(dailyLog, st, d, fuel, setName, overrides[d]?.[fuel]??null));
+        const f3 = getForecast(dailyLog, st, addDays(today,3), fuel, setName, overrides[addDays(today,3)]?.[fuel]??null) ?? 0;
 
-        // Projections
+        // Projections (no order)
         const atDay1End  = Math.max(0, effectiveD1 - (forecasts[0]??0));
         const atDay3Morn = Math.max(0, effectiveD1  - (forecasts[0]??0) - (forecasts[1]??0));
         const afterOrder = atDay3Morn + Math.max(0, idealLevel - atDay3Morn);
@@ -1394,6 +1492,23 @@ function ForecastTab({ config, dailyLog }) {
         const orderMax   = Math.max(0, Math.round(max       - atDay3Morn));
         const urgent     = atDay3Morn < minLevel && max > 0;
         const warn       = atDay3Morn < max * WARN_PCT && !urgent && max > 0;
+
+        // ── Multi-day order plan (daily ordering): order1 placed D1 arrives D3, order2 placed D2 arrives D4 ──
+        const okey   = (setName||'') + '_' + fuel;
+        const o1def  = orderMin;
+        const startD3def = atDay3Morn + o1def;
+        const endD3def   = Math.max(0, startD3def - (forecasts[2]??0));
+        const o2def  = Math.max(0, Math.round(idealLevel - endD3def));
+        const o1 = orders[okey]?.o1 ?? o1def;
+        const o2 = orders[okey]?.o2 ?? o2def;
+        const startD3 = atDay3Morn + o1;
+        const endD3   = Math.max(0, startD3 - (forecasts[2]??0));
+        const startD4 = endD3 + o2;
+        const endD4   = Math.max(0, startD4 - f3);
+        const d3Low = endD3 < minLevel && max > 0;
+        const d4Low = endD4 < minLevel && max > 0;
+        const d3Over = startD3 > max && max > 0;
+        const d4Over = startD4 > max && max > 0;
 
         // Historical same-weekday data (for context in the table)
         const hist = days.map(d => {
@@ -1557,6 +1672,45 @@ function ForecastTab({ config, dailyLog }) {
               </div>
             </div>
 
+            {/* Multi-day order plan (we order almost daily) */}
+            <div style={{ marginTop:12, background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:10, padding:14 }}>
+              <div style={{ fontWeight:700, color:'#1e3a5f', fontSize:13, marginBottom:4 }}>📅 Plan de pedidos diarios — verificar que aguantamos hasta el Día 4</div>
+              <div style={{ fontSize:11, color:'#64748b', marginBottom:12 }}>
+                Pedimos casi a diario. El pedido de hoy (Día 1) llega el Día 3; el de mañana (Día 2) llega el Día 4. Ajusta ambos y confirma que el nivel nunca baje del mínimo ({fmt(minLevel)} gal).
+              </div>
+              <div style={{ display:'flex', gap:18, flexWrap:'wrap', alignItems:'flex-end' }}>
+                <div>
+                  <label style={{ ...S.label, color:col }}>Pedido Día 1 → llega Día 3</label>
+                  <input type="number" min="0" value={o1}
+                    onChange={e=>setOrder(okey,'o1',e.target.value)}
+                    style={{ ...S.inputSm, width:120, borderColor:col }} />
+                  <div style={{ fontSize:10, color:'#94a3b8', marginTop:2 }}>sugerido: {fmt(o1def)} gal</div>
+                </div>
+                <div style={{ fontSize:20, color:'#cbd5e1', paddingBottom:8 }}>→</div>
+                <div style={{ textAlign:'center' }}>
+                  <div style={{ fontSize:11, color:'#64748b' }}>Fin Día 3</div>
+                  <div style={{ fontWeight:700, fontSize:16, color:d3Low?'#dc2626':d3Over?'#d97706':'#059669' }}>{fmt(endD3)}</div>
+                  <div style={{ fontSize:10, color:'#94a3b8' }}>{pct(endD3,max)}%{d3Low?' 🚨':d3Over?' ⚠️lleno':''}</div>
+                </div>
+                <div>
+                  <label style={{ ...S.label, color:col }}>Pedido Día 2 → llega Día 4</label>
+                  <input type="number" min="0" value={o2}
+                    onChange={e=>setOrder(okey,'o2',e.target.value)}
+                    style={{ ...S.inputSm, width:120, borderColor:col }} />
+                  <div style={{ fontSize:10, color:'#94a3b8', marginTop:2 }}>sugerido: {fmt(o2def)} gal</div>
+                </div>
+                <div style={{ fontSize:20, color:'#cbd5e1', paddingBottom:8 }}>→</div>
+                <div style={{ textAlign:'center' }}>
+                  <div style={{ fontSize:11, color:'#64748b' }}>Fin Día 4</div>
+                  <div style={{ fontWeight:700, fontSize:16, color:d4Low?'#dc2626':d4Over?'#d97706':'#059669' }}>{fmt(endD4)}</div>
+                  <div style={{ fontSize:10, color:'#94a3b8' }}>{pct(endD4,max)}%{d4Low?' 🚨':d4Over?' ⚠️lleno':''}</div>
+                </div>
+              </div>
+              {(d3Low||d4Low) && <div style={{ ...S.alert('danger'), marginTop:10, marginBottom:0 }}>🚨 Con este plan el nivel baja del mínimo {d3Low?'el Día 3':''}{d3Low&&d4Low?' y ':''}{d4Low?'el Día 4':''}. Aumenta los pedidos.</div>}
+              {(d3Over||d4Over) && !(d3Low||d4Low) && <div style={{ ...S.alert('warn'), marginTop:10, marginBottom:0 }}>⚠️ El pedido excede la capacidad del tanque ({fmt(max)} gal) — parte no cabría.</div>}
+              {!(d3Low||d4Low||d3Over||d4Over) && <div style={{ ...S.alert('ok'), marginTop:10, marginBottom:0 }}>✅ Plan seguro: el nivel se mantiene sobre el mínimo los días 3 y 4.</div>}
+            </div>
+
             {/* Holiday override */}
             <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
               <span style={{ fontSize:12, color:'#94a3b8' }}>🎉 Override feriado:</span>
@@ -1619,7 +1773,7 @@ function ForecastTab({ config, dailyLog }) {
 // ═══════════════════════════════════════════════════════════
 // ORDER TAB — plan the order with compartment allocation
 // ═══════════════════════════════════════════════════════════
-function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
+function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna, arrivals }) {
   const [groupIdx, setGroupIdx]   = useState(0);
   const [selCist,  setSelCist]    = useState('');
   const [activeStations, setActiveSt] = useState([]);
@@ -1678,7 +1832,7 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
             const min      = max * mp;
             const f1       = getForecast(dailyLog, station, today,            fuel, sn, overrides[today]?.[fuel]) ?? 0;
             const f2       = getForecast(dailyLog, station, addDays(today,1), fuel, sn, overrides[addDays(today,1)]?.[fuel]) ?? 0;
-            const pend     = getPendingDescarga(dailyLog, station, addDays(today,-1), fuel, sn) + getPendingDescarga(dailyLog, station, today, fuel, sn);
+            const pend     = pendingNow(arrivals, station, fuel, sn, today);
             const atDel    = Math.max(0, (getMorning(dailyLog,station,today,fuel,sn)??0) + getDescarga(dailyLog,station,today,fuel,sn) + pend - f1 - f2);
             const orderMin = Math.max(0, Math.round(ideal - atDel));
             const orderMax = Math.max(0, Math.round(max   - atDel));
@@ -1697,7 +1851,7 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
           const min      = max * mp;
           const f1       = getForecast(dailyLog, station, today,            fuel, null, overrides[today]?.[fuel]) ?? 0;
           const f2       = getForecast(dailyLog, station, addDays(today,1), fuel, null, overrides[addDays(today,1)]?.[fuel]) ?? 0;
-          const pend     = getPendingDescarga(dailyLog, station, addDays(today,-1), fuel, null) + getPendingDescarga(dailyLog, station, today, fuel, null);
+          const pend     = pendingNow(arrivals, station, fuel, null, today);
           const atDel    = Math.max(0, (getMorning(dailyLog,station,today,fuel,null)??0) + getDescarga(dailyLog,station,today,fuel,null) + pend - f1 - f2);
           const orderMin = Math.max(0, Math.round(ideal - atDel));
           const orderMax = Math.max(0, Math.round(max   - atDel));
@@ -1709,7 +1863,7 @@ function OrderTab({ config, dailyLog, cisternas, orderGroups, nextCisterna }) {
       }
     }
     return { targets, maxSpace, recOrders };
-  }, [activeStations, config, dailyLog, today, overrides]);
+  }, [activeStations, config, dailyLog, today, overrides, arrivals]);
 
   const totalRec = useMemo(() => {
     let t = 0;
@@ -2140,9 +2294,13 @@ function App() {
   const [cisternas,   setCisternas]   = useState(DEFAULT_CISTERNAS);
   const [orderGroups]                 = useState(DEFAULT_ORDER_GROUPS);
   const [nextCisterna, setNextCisterna] = useState({});
+  const [arrivals,    setArrivals]    = useState({});
 
   const fromCloudRef = React.useRef(false);
   const saveTimerRef = React.useRef(null);
+
+  // Read-view of dailyLog whose descarga totals are derived from arrivals (source of truth)
+  const logView = useMemo(() => buildLogView(dailyLog, arrivals), [dailyLog, arrivals]);
 
   // ── Step 1: Watch auth state ──
   useEffect(() => {
@@ -2165,6 +2323,9 @@ function App() {
         if (saved.dailyLog)     setDailyLog(saved.dailyLog);
         if (saved.cisternas)    setCisternas(saved.cisternas);
         if (saved.nextCisterna) setNextCisterna(saved.nextCisterna);
+        // arrivals: use stored if present, otherwise migrate legacy descargas (no data lost)
+        if (saved.arrivals)     setArrivals(saved.arrivals);
+        else if (saved.dailyLog) setArrivals(migrateToArrivals(saved.dailyLog, saved.cisternas || DEFAULT_CISTERNAS));
       }
       setAppReady(true);
       if (IS_CLOUD) setCloudStatus('synced');
@@ -2180,6 +2341,7 @@ function App() {
       if (data.dailyLog)     setDailyLog(data.dailyLog);
       if (data.cisternas)    setCisternas(data.cisternas);
       if (data.nextCisterna) setNextCisterna(data.nextCisterna);
+      if (data.arrivals)     setArrivals(data.arrivals);
       setCloudStatus('synced');
       requestAnimationFrame(() => { fromCloudRef.current = false; });
     });
@@ -2190,7 +2352,7 @@ function App() {
   useEffect(() => {
     if (!appReady || !currentUser) return;
     if (fromCloudRef.current) return;
-    const payload = { config, dailyLog, cisternas, orderGroups, nextCisterna };
+    const payload = { config, dailyLog, cisternas, orderGroups, nextCisterna, arrivals };
     if (IS_CLOUD) {
       setCloudStatus('saving');
       clearTimeout(saveTimerRef.current);
@@ -2202,10 +2364,10 @@ function App() {
     } else {
       saveStateAsync(payload);
     }
-  }, [config, dailyLog, cisternas, nextCisterna, appReady, currentUser]);
+  }, [config, dailyLog, cisternas, nextCisterna, arrivals, appReady, currentUser]);
 
   function exportData() {
-    const blob = new Blob([JSON.stringify({ config, dailyLog, cisternas, orderGroups, nextCisterna }, null, 2)], { type:'application/json' });
+    const blob = new Blob([JSON.stringify({ config, dailyLog, cisternas, orderGroups, nextCisterna, arrivals }, null, 2)], { type:'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `gasolineras_backup_${getTodayStr()}.json`;
@@ -2221,6 +2383,8 @@ function App() {
         if (d.dailyLog)      setDailyLog(d.dailyLog);
         if (d.cisternas)     setCisternas(d.cisternas);
         if (d.nextCisterna)  setNextCisterna(d.nextCisterna);
+        if (d.arrivals)      setArrivals(d.arrivals);
+        else if (d.dailyLog) setArrivals(migrateToArrivals(d.dailyLog, d.cisternas || DEFAULT_CISTERNAS));
         alert('✅ Datos importados.');
       } catch(err) { alert('❌ Error: '+err.message); }
     };
@@ -2228,11 +2392,12 @@ function App() {
   }
 
   const TABS = [
-    { id:'log',      label:'📋 Registro Diario' },
-    { id:'forecast', label:'📈 Pronóstico 3 Días' },
-    { id:'order',    label:'🚛 Planear Pedido' },
-    { id:'history',  label:'📅 Historial' },
-    { id:'config',   label:'⚙️ Configuración' },
+    { id:'log',       label:'📋 Registro Diario' },
+    { id:'cisternas', label:'🛢️ Cisternas' },
+    { id:'forecast',  label:'📈 Pronóstico 3 Días' },
+    { id:'order',     label:'🚛 Planear Pedido' },
+    { id:'history',   label:'📅 Historial' },
+    { id:'config',    label:'⚙️ Configuración' },
   ];
 
   // Waiting for auth check
@@ -2276,7 +2441,7 @@ function App() {
         <div style={{ fontSize:28 }}>⛽</div>
         <div style={{ flex:1 }}>
           <div style={{ fontWeight:700, fontSize:18, lineHeight:1.2 }}>Gestor de Pedidos — Gasolineras</div>
-          <div style={{ fontSize:12, opacity:0.75 }}>Puma Juticalpa · Limones · Las Delicias · La Granja · Puma Paz</div>
+          <div style={{ fontSize:12, opacity:0.75 }}>Puma Juticalpa · Limones · Las Delicias · Puma Paz</div>
         </div>
         {/* Cloud sync status */}
         <div style={{ padding:'5px 12px', borderRadius:20, background:st_badge.bg, border:`1px solid ${st_badge.color}40`, fontSize:12, fontWeight:600, color:st_badge.color, whiteSpace:'nowrap' }}>
@@ -2309,10 +2474,11 @@ function App() {
       </div>
       <div style={{ padding:20, maxWidth:1200, margin:'0 auto' }}>
         {tab==='config'   && <ConfigTab    config={config} setConfig={setConfig} cisternas={cisternas} setCisternas={setCisternas} />}
-        {tab==='log'      && <DailyLogTab  config={config} dailyLog={dailyLog} setDailyLog={setDailyLog} cisternas={cisternas} nextCisterna={nextCisterna} setNextCisterna={setNextCisterna} />}
-        {tab==='forecast' && <ForecastTab  config={config} dailyLog={dailyLog} />}
-        {tab==='order'    && <OrderTab     config={config} dailyLog={dailyLog} cisternas={cisternas} orderGroups={orderGroups} nextCisterna={nextCisterna} />}
-        {tab==='history'  && <HistoryTab   config={config} dailyLog={dailyLog} />}
+        {tab==='log'      && <DailyLogTab  config={config} dailyLog={logView} setDailyLog={setDailyLog} arrivals={arrivals} nextCisterna={nextCisterna} setNextCisterna={setNextCisterna} cisternas={cisternas} />}
+        {tab==='cisternas'&& <CisternasTab config={config} dailyLog={logView} cisternas={cisternas} arrivals={arrivals} setArrivals={setArrivals} />}
+        {tab==='forecast' && <ForecastTab  config={config} dailyLog={logView} arrivals={arrivals} />}
+        {tab==='order'    && <OrderTab     config={config} dailyLog={logView} cisternas={cisternas} orderGroups={orderGroups} nextCisterna={nextCisterna} arrivals={arrivals} />}
+        {tab==='history'  && <HistoryTab   config={config} dailyLog={logView} />}
       </div>
     </div>
   );
