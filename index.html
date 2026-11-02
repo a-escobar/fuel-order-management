@@ -30,7 +30,7 @@ const { useState, useEffect, useMemo, useCallback } = React;
 // ═══════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════
-const STATIONS    = ['Puma Juticalpa','Limones','Las Delicias','La Granja','Puma Paz'];
+const STATIONS    = ['Puma Juticalpa','Limones','Las Delicias','Puma Paz'];
 // Supply-only: we don't manage their tanks; they tell us how much they need
 const SUPPLY_ONLY = new Set(['Limones', 'Puma Paz']);
 const isSupplyOnly = s => SUPPLY_ONLY.has(s);
@@ -38,7 +38,7 @@ const FUELS       = ['Regular','Super','Diesel'];
 const DAYS_ES     = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
 
 // Juticalpa underground sets and which fuels each carries
-const JUTA_SETS = { 'Set 1': ['Regular','Super','Diesel'], 'Set 2': ['Super','Diesel'] };
+const JUTA_SETS = { 'Set 1': ['Regular','Super','Diesel'], 'Set 2': ['Regular','Super','Diesel'] };
 
 const FUEL_ICONS  = { Regular:'⛽', Super:'⚡', Diesel:'🔧' };
 // Regular=Yellow, Super=Red, Diesel=Green — uniform throughout the app
@@ -47,7 +47,7 @@ const FUEL_LIGHT  = { Regular:'#fef9c3', Super:'#fee2e2', Diesel:'#d1fae5' };
 const SET_COLORS  = { 'Set 1':'#1e3a5f', 'Set 2':'#7c3aed' };
 const STATION_COLORS = {
   'Puma Juticalpa':'#1e3a5f','Limones':'#7c3aed',
-  'Las Delicias':'#db2777','La Granja':'#d97706','Puma Paz':'#059669'
+  'Las Delicias':'#db2777','Puma Paz':'#059669'
 };
 
 // Operating thresholds (defaults; per-set overrides come from config)
@@ -93,8 +93,8 @@ const DEFAULT_CISTERNAS = {
 const DEFAULT_ORDER_GROUPS = [
   { id:'jut', name:'Juticalpa / Limones', desc:'~2x semana. Limones se une según necesidad.',
     stations:['Puma Juticalpa','Limones'], cisternas:['923','6738','1909'] },
-  { id:'las', name:'Las Delicias / Puma Paz / La Granja', desc:'Solo Cisterna 7150, siempre compartida.',
-    stations:['Las Delicias','Puma Paz','La Granja'], cisternas:['7150'] }
+  { id:'las', name:'Las Delicias / Puma Paz', desc:'Solo Cisterna 7150, siempre compartida.',
+    stations:['Las Delicias','Puma Paz'], cisternas:['7150'] }
 ];
 
 // ═══════════════════════════════════════════════════════════
@@ -394,11 +394,10 @@ function defaultConfig() {
     stationConfig: {
       'Puma Juticalpa': { type:'sets', sets: {
         'Set 1': { Regular:{max:6000}, Super:{max:6000}, Diesel:{max:8000} },
-        'Set 2': { Super:{max:7000}, Diesel:{max:7000} }
+        'Set 2': { Regular:{max:6000}, Super:{max:7000}, Diesel:{max:7000} }
       }},
       'Limones':      { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
       'Las Delicias': { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
-      'La Granja':    { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }},
       'Puma Paz':     { type:'simple', fuels:{ Regular:{max:10000}, Super:{max:10000}, Diesel:{max:10000} }}
     }
   };
@@ -687,7 +686,7 @@ function ConfigTab({ config, setConfig, cisternas, setCisternas }) {
 
         {/* Non-Juticalpa stations */}
         <div style={{ marginBottom:16 }}>
-          <div style={{ fontWeight:600, color:'#64748b', fontSize:13, marginBottom:10 }}>Las Delicias · La Granja (gasolineras simples)</div>
+          <div style={{ fontWeight:600, color:'#64748b', fontSize:13, marginBottom:10 }}>Las Delicias (gasolinera simple)</div>
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:20 }} className="g2">
             <div>
               <label style={S.label}>Nivel mínimo (%)</label>
@@ -971,7 +970,7 @@ function DailyLogTab({ config, dailyLog, setDailyLog, arrivals, nextCisterna, se
   }
 
   // ════════════════════════════════════════
-  // REGULAR STATION (Juticalpa, Las Delicias, La Granja)
+  // REGULAR STATION (Juticalpa, Las Delicias)
   // ════════════════════════════════════════
   return (
     <div>
@@ -2442,7 +2441,7 @@ function App() {
         <div style={{ fontSize:28 }}>⛽</div>
         <div style={{ flex:1 }}>
           <div style={{ fontWeight:700, fontSize:18, lineHeight:1.2 }}>Gestor de Pedidos — Gasolineras</div>
-          <div style={{ fontSize:12, opacity:0.75 }}>Puma Juticalpa · Limones · Las Delicias · La Granja · Puma Paz</div>
+          <div style={{ fontSize:12, opacity:0.75 }}>Puma Juticalpa · Limones · Las Delicias · Puma Paz</div>
         </div>
         {/* Cloud sync status */}
         <div style={{ padding:'5px 12px', borderRadius:20, background:st_badge.bg, border:`1px solid ${st_badge.color}40`, fontSize:12, fontWeight:600, color:st_badge.color, whiteSpace:'nowrap' }}>
